@@ -1,16 +1,20 @@
--- Supabase Schema for Base PumpFun
--- Run this SQL in your Supabase SQL Editor to create the required tables
+-- Supabase schema (greenfield / full reset).
+-- Run this SQL in the Supabase SQL Editor to create the required tables.
+--
+-- Existing projects: run supabase-migration-multi-chain.sql instead (or after an older
+-- snapshot) to add chain columns, composite uniques, and reward/trader_fee tables.
 
 -- Enable UUID extension
 CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
 
 -- ============================================
--- TOKENS TABLE
+-- TOKENS TABLE (multi-chain slugs: solana, base, polygon, bsc, eth, …)
 -- ============================================
 CREATE TABLE IF NOT EXISTS tokens (
     id UUID DEFAULT uuid_generate_v4() PRIMARY KEY,
-    token_address TEXT NOT NULL UNIQUE,
-    bonding_curve_address TEXT NOT NULL UNIQUE,
+    chain TEXT NOT NULL DEFAULT 'evm',
+    token_address TEXT NOT NULL,
+    bonding_curve_address TEXT NOT NULL,
     creator TEXT NOT NULL,
     name TEXT NOT NULL,
     symbol TEXT NOT NULL,
@@ -23,7 +27,7 @@ CREATE TABLE IF NOT EXISTS tokens (
     banner_url TEXT DEFAULT '',
     total_supply TEXT NOT NULL,
     decimals INTEGER DEFAULT 18,
-    transaction_hash TEXT NOT NULL UNIQUE,
+    transaction_hash TEXT NOT NULL,
     block_number INTEGER NOT NULL,
     timestamp BIGINT NOT NULL,
     initial_price TEXT DEFAULT '0',
@@ -31,20 +35,25 @@ CREATE TABLE IF NOT EXISTS tokens (
     price_changed_24h NUMERIC(10, 2),
     status TEXT DEFAULT 'active' CHECK (status IN ('active', 'completed', 'failed')),
     created_at TIMESTAMPTZ DEFAULT NOW(),
-    updated_at TIMESTAMPTZ DEFAULT NOW()
+    updated_at TIMESTAMPTZ DEFAULT NOW(),
+    UNIQUE (chain, token_address),
+    UNIQUE (chain, bonding_curve_address),
+    UNIQUE (chain, transaction_hash)
 );
 
 -- Indexes for tokens
 CREATE INDEX IF NOT EXISTS idx_tokens_creator ON tokens(creator);
 CREATE INDEX IF NOT EXISTS idx_tokens_timestamp ON tokens(timestamp DESC);
 CREATE INDEX IF NOT EXISTS idx_tokens_status ON tokens(status);
+CREATE INDEX IF NOT EXISTS idx_tokens_chain ON tokens(chain);
 
 -- ============================================
--- BONDING CURVES TABLE
+-- BONDING CURVES TABLE (multi-chain)
 -- ============================================
 CREATE TABLE IF NOT EXISTS bonding_curves (
     id UUID DEFAULT uuid_generate_v4() PRIMARY KEY,
-    bonding_curve_address TEXT NOT NULL UNIQUE,
+    chain TEXT NOT NULL DEFAULT 'evm',
+    bonding_curve_address TEXT NOT NULL,
     token_address TEXT NOT NULL,
     creator TEXT NOT NULL,
     virtual_eth_lp TEXT NOT NULL,
@@ -60,12 +69,17 @@ CREATE TABLE IF NOT EXISTS bonding_curves (
     total_sellers INTEGER DEFAULT 0,
     lp_created BOOLEAN DEFAULT FALSE,
     liquidity_token_id TEXT,
+    liquidity_lock_duration_seconds TEXT,
+    liquidity_unlock_timestamp BIGINT,
+    lp_unlocked BOOLEAN DEFAULT FALSE,
     start_timestamp BIGINT NOT NULL,
-    transaction_hash TEXT NOT NULL UNIQUE,
+    transaction_hash TEXT NOT NULL,
     block_number INTEGER NOT NULL,
     status TEXT DEFAULT 'active' CHECK (status IN ('active', 'completed', 'failed')),
     created_at TIMESTAMPTZ DEFAULT NOW(),
-    updated_at TIMESTAMPTZ DEFAULT NOW()
+    updated_at TIMESTAMPTZ DEFAULT NOW(),
+    UNIQUE (chain, bonding_curve_address),
+    UNIQUE (chain, transaction_hash)
 );
 
 -- Indexes for bonding_curves
@@ -74,6 +88,7 @@ CREATE INDEX IF NOT EXISTS idx_bonding_curves_creator ON bonding_curves(creator)
 CREATE INDEX IF NOT EXISTS idx_bonding_curves_timestamp ON bonding_curves(start_timestamp DESC);
 CREATE INDEX IF NOT EXISTS idx_bonding_curves_volume ON bonding_curves(volume DESC);
 CREATE INDEX IF NOT EXISTS idx_bonding_curves_status ON bonding_curves(status);
+CREATE INDEX IF NOT EXISTS idx_bonding_curves_chain ON bonding_curves(chain);
 
 -- ============================================
 -- CHAT MESSAGES TABLE (Comments)
@@ -135,10 +150,11 @@ CREATE TABLE IF NOT EXISTS profiles (
 CREATE INDEX IF NOT EXISTS idx_profiles_username ON profiles(username);
 
 -- ============================================
--- TRADE HISTORY TABLE
+-- TRADE HISTORY TABLE (multi-chain; same tx can exist per chain)
 -- ============================================
 CREATE TABLE IF NOT EXISTS trade_history (
     id UUID DEFAULT uuid_generate_v4() PRIMARY KEY,
+    chain TEXT NOT NULL DEFAULT 'evm',
     token_address TEXT NOT NULL,
     bonding_curve_address TEXT NOT NULL,
     trader TEXT NOT NULL,
@@ -146,16 +162,72 @@ CREATE TABLE IF NOT EXISTS trade_history (
     eth_amount TEXT NOT NULL,
     token_amount TEXT NOT NULL,
     price TEXT NOT NULL,
-    transaction_hash TEXT NOT NULL UNIQUE,
+    transaction_hash TEXT NOT NULL,
     block_number INTEGER NOT NULL,
     timestamp BIGINT NOT NULL,
-    created_at TIMESTAMPTZ DEFAULT NOW()
+    created_at TIMESTAMPTZ DEFAULT NOW(),
+    UNIQUE (chain, transaction_hash)
 );
 
 -- Indexes for trade_history
 CREATE INDEX IF NOT EXISTS idx_trades_token ON trade_history(token_address);
 CREATE INDEX IF NOT EXISTS idx_trades_trader ON trade_history(trader);
 CREATE INDEX IF NOT EXISTS idx_trades_timestamp ON trade_history(timestamp DESC);
+CREATE INDEX IF NOT EXISTS idx_trades_chain ON trade_history(chain);
+
+-- ============================================
+-- TRADER FEES (Solana + EVM; reward distribution)
+-- ============================================
+CREATE TABLE IF NOT EXISTS trader_fees (
+    id UUID DEFAULT uuid_generate_v4() PRIMARY KEY,
+    wallet_address TEXT NOT NULL,
+    mint TEXT NOT NULL,
+    trade_type BOOLEAN NOT NULL,
+    platform_fee TEXT NOT NULL DEFAULT '0',
+    creator_fee TEXT NOT NULL DEFAULT '0',
+    fee_amount TEXT NOT NULL DEFAULT '0',
+    transaction_hash TEXT NOT NULL,
+    slot BIGINT,
+    block_time BIGINT,
+    chain TEXT NOT NULL DEFAULT 'solana',
+    claimed BOOLEAN NOT NULL DEFAULT FALSE,
+    claimed_at TIMESTAMPTZ,
+    created_at TIMESTAMPTZ DEFAULT NOW(),
+    UNIQUE (chain, transaction_hash)
+);
+
+CREATE INDEX IF NOT EXISTS idx_trader_fees_wallet ON trader_fees(wallet_address);
+CREATE INDEX IF NOT EXISTS idx_trader_fees_chain ON trader_fees(chain);
+CREATE INDEX IF NOT EXISTS idx_trader_fees_claimed ON trader_fees(claimed) WHERE claimed = FALSE;
+
+-- ============================================
+-- REWARD DISTRIBUTION
+-- ============================================
+CREATE TABLE IF NOT EXISTS reward_distribution_config (
+    id UUID DEFAULT uuid_generate_v4() PRIMARY KEY,
+    cycle TEXT NOT NULL DEFAULT '5min',
+    reward_ratio DOUBLE PRECISION NOT NULL DEFAULT 0.5,
+    next_distribution_at TIMESTAMPTZ NOT NULL,
+    minimum_reward_lamports BIGINT NOT NULL DEFAULT 1000,
+    created_at TIMESTAMPTZ DEFAULT NOW(),
+    updated_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+CREATE TABLE IF NOT EXISTS reward_distribution_runs (
+    id UUID DEFAULT uuid_generate_v4() PRIMARY KEY,
+    distribution_at TIMESTAMPTZ NOT NULL,
+    cycle TEXT NOT NULL,
+    reward_ratio DOUBLE PRECISION NOT NULL,
+    total_fees_lamports TEXT NOT NULL,
+    total_rewards_lamports TEXT NOT NULL,
+    trader_count INTEGER NOT NULL DEFAULT 0,
+    success_count INTEGER NOT NULL DEFAULT 0,
+    fail_count INTEGER NOT NULL DEFAULT 0,
+    chain TEXT,
+    created_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_reward_runs_distribution_at ON reward_distribution_runs(distribution_at DESC);
 
 -- ============================================
 -- ENABLE REALTIME FOR TABLES
@@ -188,6 +260,9 @@ ALTER TABLE chat_messages ENABLE ROW LEVEL SECURITY;
 ALTER TABLE token_price_data ENABLE ROW LEVEL SECURITY;
 ALTER TABLE profiles ENABLE ROW LEVEL SECURITY;
 ALTER TABLE trade_history ENABLE ROW LEVEL SECURITY;
+ALTER TABLE trader_fees ENABLE ROW LEVEL SECURITY;
+ALTER TABLE reward_distribution_config ENABLE ROW LEVEL SECURITY;
+ALTER TABLE reward_distribution_runs ENABLE ROW LEVEL SECURITY;
 
 -- Allow public read access to all tables
 CREATE POLICY "Allow public read access" ON tokens FOR SELECT USING (true);
@@ -196,6 +271,8 @@ CREATE POLICY "Allow public read access" ON chat_messages FOR SELECT USING (true
 CREATE POLICY "Allow public read access" ON token_price_data FOR SELECT USING (true);
 CREATE POLICY "Allow public read access" ON profiles FOR SELECT USING (true);
 CREATE POLICY "Allow public read access" ON trade_history FOR SELECT USING (true);
+
+-- Trader fees & reward tables: backend (service role) only — no public policies
 
 -- Allow anonymous users to insert chat messages (comments)
 CREATE POLICY "Allow anonymous insert chat messages" ON chat_messages FOR INSERT WITH CHECK (true);
@@ -216,6 +293,9 @@ CREATE POLICY "Allow service role full access" ON chat_messages FOR ALL USING (a
 CREATE POLICY "Allow service role full access" ON token_price_data FOR ALL USING (auth.role() = 'service_role');
 CREATE POLICY "Allow service role full access" ON profiles FOR ALL USING (auth.role() = 'service_role');
 CREATE POLICY "Allow service role full access" ON trade_history FOR ALL USING (auth.role() = 'service_role');
+CREATE POLICY "Allow service role full access" ON trader_fees FOR ALL USING (auth.role() = 'service_role');
+CREATE POLICY "Allow service role full access" ON reward_distribution_config FOR ALL USING (auth.role() = 'service_role');
+CREATE POLICY "Allow service role full access" ON reward_distribution_runs FOR ALL USING (auth.role() = 'service_role');
 
 -- ============================================
 -- FUNCTIONS FOR UPDATED_AT TRIGGER
@@ -238,3 +318,5 @@ CREATE TRIGGER update_bonding_curves_updated_at BEFORE UPDATE ON bonding_curves
 CREATE TRIGGER update_profiles_updated_at BEFORE UPDATE ON profiles
     FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
 
+CREATE TRIGGER update_reward_distribution_config_updated_at BEFORE UPDATE ON reward_distribution_config
+    FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();

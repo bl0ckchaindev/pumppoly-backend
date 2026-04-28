@@ -1,4 +1,5 @@
 const { supabase } = require('../config/supabase');
+const { isSolanaChain, isEvmCompatibleChain, getEvmChainSlug } = require('../lib/chainUtils');
 
 // Helper to detect if address is Solana (base58) or EVM (hex with 0x prefix)
 const isSolanaAddress = (address) => {
@@ -11,7 +12,7 @@ const isSolanaAddress = (address) => {
 const normalizeAddress = (address, chain = null) => {
     if (!address) return address;
     const addr = String(address);
-    const issolana = chain === 'solana' || (chain === null && isSolanaAddress(addr));
+    const issolana = isSolanaChain(chain) || (chain === null && isSolanaAddress(addr));
     return issolana ? addr : addr.toLowerCase();
 };
 
@@ -20,10 +21,10 @@ class SupabaseService {
     // TOKENS
     // ============================================
     async createToken(tokenData) {
-        const chain = tokenData.chain || 'evm';
+        const chain = tokenData.chain || getEvmChainSlug();
         // Solana addresses are base58, don't lowercase them
         const normalizeAddress = (addr, chainType) => {
-            return chainType === 'solana' ? addr : addr.toLowerCase();
+            return isSolanaChain(chainType) ? addr : addr.toLowerCase();
         };
         const insertData = {
             token_address: normalizeAddress(tokenData.tokenAddress, chain),
@@ -40,7 +41,7 @@ class SupabaseService {
                 banner_url: tokenData.bannerUrl || '',
                 total_supply: tokenData.totalSupply || '0',
                 decimals: tokenData.decimals || 18,
-            transaction_hash: chain === 'solana' ? String(tokenData.transactionHash || '') : String(tokenData.transactionHash || '').toLowerCase(),
+            transaction_hash: isSolanaChain(chain) ? String(tokenData.transactionHash || '') : String(tokenData.transactionHash || '').toLowerCase(),
                 block_number: tokenData.blockNumber,
                 timestamp: tokenData.timestamp,
                 initial_price: tokenData.initialPrice || '0',
@@ -63,7 +64,7 @@ class SupabaseService {
         if (error) {
             // Provide helpful error message if chain column is missing
             if (error.message && (error.message.includes('chain') || error.message.includes('column') && error.message.includes('does not exist'))) {
-                throw new Error(`Database schema error: ${error.message}. Please run the migration script: supabase-migration-solana.sql`);
+                throw new Error(`Database schema error: ${error.message}. Please run the migration script: supabase-migration-multi-chain.sql`);
             }
             throw error;
         }
@@ -72,7 +73,7 @@ class SupabaseService {
 
     async getTokenByAddress(tokenAddress, chain = null) {
         // Solana addresses are base58, don't lowercase them
-        const normalizedAddress = chain === 'solana' ? tokenAddress : tokenAddress.toLowerCase();
+        const normalizedAddress = isSolanaChain(chain) ? tokenAddress : tokenAddress.toLowerCase();
         let query = supabase
             .from('tokens')
             .select('*')
@@ -88,8 +89,8 @@ class SupabaseService {
         return data ? this.transformToken(data) : null;
     }
 
-    async updateToken(tokenAddress, updateData, chain = 'evm') {
-        const address = chain === 'solana' ? String(tokenAddress || '') : String(tokenAddress || '').toLowerCase();
+    async updateToken(tokenAddress, updateData, chain = getEvmChainSlug()) {
+        const address = isSolanaChain(chain) ? String(tokenAddress || '') : String(tokenAddress || '').toLowerCase();
         const mappedData = {};
         if (updateData.logoUrl !== undefined) mappedData.logo_url = String(updateData.logoUrl);
         if (updateData.bannerUrl !== undefined) mappedData.banner_url = String(updateData.bannerUrl);
@@ -132,16 +133,16 @@ class SupabaseService {
     // BONDING CURVES
     // ============================================
     async createBondingCurve(curveData) {
-        const chain = curveData.chain || 'evm';
+        const chain = curveData.chain || getEvmChainSlug();
         // Solana addresses are base58, don't lowercase them
-        const normalizeAddress = (addr) => chain === 'solana' ? String(addr || '') : String(addr || '').toLowerCase();
+        const normalizeAddress = (addr) => isSolanaChain(chain) ? String(addr || '') : String(addr || '').toLowerCase();
         const bondingCurveAddr = normalizeAddress(curveData.bondingCurveAddress);
         const tokenAddr = normalizeAddress(curveData.tokenAddress);
         const creatorAddr = normalizeAddress(curveData.creator);
-        const txHash = chain === 'solana' ? String(curveData.transactionHash || '') : String(curveData.transactionHash || '').toLowerCase();
+        const txHash = isSolanaChain(chain) ? String(curveData.transactionHash || '') : String(curveData.transactionHash || '').toLowerCase();
 
         // Validate addresses based on chain
-        if (chain === 'evm') {
+        if (isEvmCompatibleChain(chain)) {
         if (!bondingCurveAddr.match(/^0x[a-f0-9]{40}$/)) {
             throw new Error('Invalid bonding curve address format');
         }
@@ -154,7 +155,7 @@ class SupabaseService {
         if (txHash && !txHash.match(/^0x[a-f0-9]{64}$/)) {
             throw new Error('Invalid transaction hash format');
             }
-        } else if (chain === 'solana') {
+        } else if (isSolanaChain(chain)) {
             // Solana addresses are base58 encoded, typically 32-44 characters
             if (bondingCurveAddr.length < 32 || bondingCurveAddr.length > 44) {
                 throw new Error('Invalid Solana bonding curve address format');
@@ -187,6 +188,16 @@ class SupabaseService {
             status: 'active'
         };
 
+        if (curveData.liquidityLockDurationSeconds != null && curveData.liquidityLockDurationSeconds !== '') {
+            insertData.liquidity_lock_duration_seconds = String(curveData.liquidityLockDurationSeconds);
+        }
+        if (curveData.liquidityUnlockTimestamp != null && curveData.liquidityUnlockTimestamp !== '') {
+            insertData.liquidity_unlock_timestamp = Number(curveData.liquidityUnlockTimestamp);
+        }
+        if (curveData.lpUnlocked === true || curveData.lpUnlocked === false) {
+            insertData.lp_unlocked = Boolean(curveData.lpUnlocked);
+        }
+
         // Only add chain if migration has been run (column exists)
         // If column doesn't exist, insert will fail and we'll catch it
         if (chain) {
@@ -202,7 +213,7 @@ class SupabaseService {
         if (error) {
             // Provide helpful error message if chain column is missing
             if (error.message && (error.message.includes('chain') || (error.message.includes('column') && error.message.includes('does not exist')))) {
-                throw new Error(`Database schema error: ${error.message}. Please run the migration script: supabase-migration-solana.sql`);
+                throw new Error(`Database schema error: ${error.message}. Please run the migration script: supabase-migration-multi-chain.sql`);
             }
             throw error;
         }
@@ -211,7 +222,7 @@ class SupabaseService {
 
     async getBondingCurveByAddress(bondingCurveAddress, chain = null) {
         // Solana addresses are base58, don't lowercase them
-        const normalizedAddress = chain === 'solana' ? bondingCurveAddress : bondingCurveAddress.toLowerCase();
+        const normalizedAddress = isSolanaChain(chain) ? bondingCurveAddress : bondingCurveAddress.toLowerCase();
         let query = supabase
             .from('bonding_curves')
             .select('*')
@@ -260,14 +271,14 @@ class SupabaseService {
 
     async updateBondingCurve(bondingCurveAddress, updateData) {
         // Validate address and sanitize input
-        const chain = updateData.chain || 'evm';
+        const chain = updateData.chain || getEvmChainSlug();
         // Solana addresses are base58, don't lowercase them
-        const address = chain === 'solana' ? String(bondingCurveAddress || '') : String(bondingCurveAddress || '').toLowerCase();
+        const address = isSolanaChain(chain) ? String(bondingCurveAddress || '') : String(bondingCurveAddress || '').toLowerCase();
         
         // Validate based on chain
-        if (chain === 'evm' && (!address || !address.match(/^0x[a-f0-9]{40}$/))) {
+        if (isEvmCompatibleChain(chain) && (!address || !address.match(/^0x[a-f0-9]{40}$/))) {
             throw new Error('Invalid EVM bonding curve address');
-        } else if (chain === 'solana' && (address.length < 32 || address.length > 44)) {
+        } else if (isSolanaChain(chain) && (address.length < 32 || address.length > 44)) {
             throw new Error('Invalid Solana bonding curve address');
         }
 
@@ -285,6 +296,13 @@ class SupabaseService {
         if (updateData.lpCreated !== undefined) mappedData.lp_created = Boolean(updateData.lpCreated);
         if (updateData.liquidityTokenId !== undefined) mappedData.liquidity_token_id = updateData.liquidityTokenId;
         if (updateData.status !== undefined) mappedData.status = String(updateData.status);
+        if (updateData.liquidityLockDurationSeconds !== undefined) {
+            mappedData.liquidity_lock_duration_seconds = String(updateData.liquidityLockDurationSeconds);
+        }
+        if (updateData.liquidityUnlockTimestamp !== undefined) {
+            mappedData.liquidity_unlock_timestamp = Number(updateData.liquidityUnlockTimestamp);
+        }
+        if (updateData.lpUnlocked !== undefined) mappedData.lp_unlocked = Boolean(updateData.lpUnlocked);
 
         let query = supabase
             .from('bonding_curves')
@@ -316,7 +334,7 @@ class SupabaseService {
                 if (retryError) {
                     // Provide helpful error message if chain column is missing
                     if (retryError.message && (retryError.message.includes('chain') || (retryError.message.includes('column') && retryError.message.includes('does not exist')))) {
-                        throw new Error(`Database schema error: ${retryError.message}. Please run the migration script: supabase-migration-solana.sql`);
+                        throw new Error(`Database schema error: ${retryError.message}. Please run the migration script: supabase-migration-multi-chain.sql`);
                     }
                     throw retryError;
                 }
@@ -324,7 +342,7 @@ class SupabaseService {
             }
             // Provide helpful error message if chain column is missing
             if (error.message && (error.message.includes('chain') || (error.message.includes('column') && error.message.includes('does not exist')))) {
-                throw new Error(`Database schema error: ${error.message}. Please run the migration script: supabase-migration-solana.sql`);
+                throw new Error(`Database schema error: ${error.message}. Please run the migration script: supabase-migration-multi-chain.sql`);
             }
             throw error;
         }
@@ -376,7 +394,7 @@ class SupabaseService {
         if (error) {
             // If error is about chain column not existing, retry without chain
             if (error.message && (error.message.includes('chain') || error.message.includes('does not exist'))) {
-                console.warn('⚠ Chain column not found in database. Please run migration: supabase-migration-solana.sql');
+                console.warn('⚠ Chain column not found in database. Please run migration: supabase-migration-multi-chain.sql');
                 console.warn('⚠ Retrying query without chain column...');
                 const retryQuery = supabase
                     .from('bonding_curves')
@@ -384,11 +402,11 @@ class SupabaseService {
                     .eq('status', 'active');
                 const { data: retryData, error: retryError } = await retryQuery;
                 if (retryError) {
-                    throw new Error(`Database query failed: ${retryError.message}. Please run the migration script: supabase-migration-solana.sql`);
+                    throw new Error(`Database query failed: ${retryError.message}. Please run the migration script: supabase-migration-multi-chain.sql`);
                 }
                 return retryData.map(bc => ({ 
                     bondingCurveAddress: bc.bonding_curve_address,
-                    chain: 'evm' // Default to evm if chain column doesn't exist
+                    chain: getEvmChainSlug() // Default if chain column doesn't exist
                 }));
             }
             throw error;
@@ -396,7 +414,7 @@ class SupabaseService {
         
         return data.map(bc => ({ 
             bondingCurveAddress: bc.bonding_curve_address,
-            chain: bc.chain || 'evm'
+            chain: bc.chain || getEvmChainSlug()
         }));
     }
 
@@ -468,11 +486,11 @@ class SupabaseService {
     // TOKEN PRICE DATA (Charts)
     // ============================================
     async addTokenPriceData(priceData) {
-        const chain = priceData.chain || 'evm';
+        const chain = priceData.chain || getEvmChainSlug();
         
         // Normalize addresses based on chain (Solana addresses are base58, don't lowercase)
-        const normalizeAddress = (addr) => chain === 'solana' ? String(addr || '') : String(addr || '').toLowerCase();
-        const normalizeTxHash = (hash) => chain === 'solana' ? String(hash || '') : String(hash || '').toLowerCase();
+        const normalizeAddress = (addr) => isSolanaChain(chain) ? String(addr || '') : String(addr || '').toLowerCase();
+        const normalizeTxHash = (hash) => isSolanaChain(chain) ? String(hash || '') : String(hash || '').toLowerCase();
         
         // Validate transaction hash based on chain
         const txHash = normalizeTxHash(priceData.transactionHash);
@@ -481,9 +499,9 @@ class SupabaseService {
         }
         
         // EVM: 0x + 64 hex chars; Solana: base58 signature (typically 87-88 chars)
-        if (chain === 'evm' && !txHash.match(/^0x[a-f0-9]{64}$/)) {
+        if (isEvmCompatibleChain(chain) && !txHash.match(/^0x[a-f0-9]{64}$/)) {
             throw new Error('Invalid EVM transaction hash format');
-        } else if (chain === 'solana' && (txHash.length < 80 || txHash.length > 100)) {
+        } else if (isSolanaChain(chain) && (txHash.length < 80 || txHash.length > 100)) {
             throw new Error('Invalid Solana transaction signature format');
         }
 
@@ -565,9 +583,9 @@ class SupabaseService {
         return data.map(p => this.transformPriceData(p));
     }
 
-    async checkPriceDataExists(transactionHash, chain = 'evm') {
+    async checkPriceDataExists(transactionHash, chain = getEvmChainSlug()) {
         // Normalize tx hash for consistent lookup (EVM: lowercase, Solana: as-is)
-        const normalized = (chain === 'solana' ? String(transactionHash || '') : String(transactionHash || '').toLowerCase());
+        const normalized = (isSolanaChain(chain) ? String(transactionHash || '') : String(transactionHash || '').toLowerCase());
         if (!normalized) return false;
         const { data, error } = await supabase
             .from('token_price_data')
@@ -583,11 +601,11 @@ class SupabaseService {
     // TRADE HISTORY
     // ============================================
     async addTradeHistory(tradeData) {
-        const chain = tradeData.chain || 'evm';
+        const chain = tradeData.chain || getEvmChainSlug();
         // Solana addresses are base58, don't lowercase them
-        const normalizeAddress = (addr) => chain === 'solana' ? String(addr || '') : String(addr || '').toLowerCase();
+        const normalizeAddress = (addr) => isSolanaChain(chain) ? String(addr || '') : String(addr || '').toLowerCase();
         // Solana transaction hashes are base58, don't lowercase them
-        const normalizeTxHash = (hash) => chain === 'solana' ? String(hash || '') : String(hash || '').toLowerCase();
+        const normalizeTxHash = (hash) => isSolanaChain(chain) ? String(hash || '') : String(hash || '').toLowerCase();
         const normalizedTxHash = normalizeTxHash(tradeData.transactionHash);
 
         // Check if trade already exists (duplicate check)
@@ -662,7 +680,7 @@ class SupabaseService {
 
     async getTradeHistoryByToken(tokenAddress, limit = 100, chain = null) {
         // Solana addresses are base58, don't lowercase them
-        const normalizedAddress = chain === 'solana' ? tokenAddress : tokenAddress.toLowerCase();
+        const normalizedAddress = isSolanaChain(chain) ? tokenAddress : tokenAddress.toLowerCase();
         const { data, error } = await supabase
             .from('trade_history')
             .select('*')
@@ -692,13 +710,13 @@ class SupabaseService {
     async insertTraderFee(feeData) {
         const chain = feeData.chain || 'solana';
         // Normalize addresses based on chain
-        const walletAddress = chain === 'solana' 
+        const walletAddress = isSolanaChain(chain) 
             ? String(feeData.walletAddress || '').trim()
             : String(feeData.walletAddress || '').toLowerCase().trim();
-        const mint = chain === 'solana'
+        const mint = isSolanaChain(chain)
             ? String(feeData.mint || '').trim()
             : String(feeData.mint || '').toLowerCase().trim();
-        const txHash = chain === 'solana'
+        const txHash = isSolanaChain(chain)
             ? String(feeData.transactionHash || '')
             : String(feeData.transactionHash || '').toLowerCase();
             
@@ -739,8 +757,8 @@ class SupabaseService {
      * @param {string} chain - 'solana' | 'evm'
      * @returns {Promise<boolean>}
      */
-    async checkTraderFeeExists(transactionHash, chain = 'evm') {
-        const normalized = (chain === 'solana' ? String(transactionHash || '') : String(transactionHash || '').toLowerCase());
+    async checkTraderFeeExists(transactionHash, chain = getEvmChainSlug()) {
+        const normalized = (isSolanaChain(chain) ? String(transactionHash || '') : String(transactionHash || '').toLowerCase());
         if (!normalized) return false;
         let query = supabase
             .from('trader_fees')
@@ -941,6 +959,26 @@ class SupabaseService {
         return (data || []).length;
     }
 
+    /**
+     * Distinct chain slugs that may need a reward round (Solana + this deployment’s EVM slug + any present in DB).
+     */
+    async getChainsToDistribute() {
+        const slug = getEvmChainSlug();
+        const chains = new Set(['solana', slug]);
+        const { data: feeRows } = await supabase.from('trader_fees').select('chain');
+        for (const r of feeRows || []) {
+            if (r && r.chain) chains.add(String(r.chain));
+        }
+        const { data: tokenRows } = await supabase
+            .from('tokens')
+            .select('chain')
+            .gt('fee_amount', '0');
+        for (const r of tokenRows || []) {
+            if (r && r.chain) chains.add(String(r.chain));
+        }
+        return Array.from(chains);
+    }
+
     // ============================================
     // CREATOR FEES (per-token fee_amount in tokens table)
     // ============================================
@@ -964,8 +1002,8 @@ class SupabaseService {
                 fee_amount: String(next),
                 updated_at: new Date().toISOString()
             })
-            .eq('token_address', chain === 'solana' ? tokenAddress : tokenAddress.toLowerCase())
-            .eq('chain', chain || 'solana');
+            .eq('token_address', isSolanaChain(chain) ? tokenAddress : tokenAddress.toLowerCase())
+            .eq('chain', chain);
         if (error) throw error;
     }
 
@@ -1022,7 +1060,7 @@ class SupabaseService {
                 fee_amount: '0',
                 updated_at: new Date().toISOString()
             })
-            .eq('token_address', chain === 'solana' ? tokenAddress : tokenAddress.toLowerCase())
+            .eq('token_address', isSolanaChain(chain) ? tokenAddress : tokenAddress.toLowerCase())
             .eq('chain', chain);
         if (error) throw error;
     }
@@ -1206,7 +1244,7 @@ class SupabaseService {
             id: data.id,
             tokenAddress: data.token_address,
             bondingCurveAddress: data.bonding_curve_address,
-            chain: data.chain || 'evm',
+            chain: data.chain || getEvmChainSlug(),
             creator: data.creator,
             name: data.name,
             symbol: data.symbol,
@@ -1236,7 +1274,7 @@ class SupabaseService {
             id: data.id,
             bondingCurveAddress: data.bonding_curve_address,
             tokenAddress: data.token_address,
-            chain: data.chain || 'evm',
+            chain: data.chain || getEvmChainSlug(),
             creator: data.creator,
             virtualEthLp: data.virtual_eth_lp,
             virtualTokenLp: data.virtual_token_lp,
@@ -1251,6 +1289,9 @@ class SupabaseService {
             totalSellers: data.total_sellers,
             lpCreated: data.lp_created,
             liquidityTokenId: data.liquidity_token_id,
+            liquidityLockDurationSeconds: data.liquidity_lock_duration_seconds ?? null,
+            liquidityUnlockTimestamp: data.liquidity_unlock_timestamp ?? null,
+            lpUnlocked: data.lp_unlocked ?? false,
             startTimestamp: data.start_timestamp,
             transactionHash: data.transaction_hash,
             blockNumber: data.block_number,
@@ -1297,7 +1338,7 @@ class SupabaseService {
             id: data.id,
             tokenAddress: data.token_address,
             bondingCurveAddress: data.bonding_curve_address,
-            chain: data.chain || 'evm',
+            chain: data.chain || getEvmChainSlug(),
             trader: data.trader,
             isBuy: data.is_buy,
             ethAmount: data.eth_amount,

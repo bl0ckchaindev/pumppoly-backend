@@ -1,5 +1,6 @@
 const cron = require('node-cron');
 const { httpRpcUrl } = require('../config');
+const { getEvmChainSlug } = require('../lib/chainUtils');
 
 class CronService {
     constructor() {
@@ -32,7 +33,7 @@ class CronService {
         const healthCheckJob = cron.schedule('0 * * * *', async () => {
             try {
                 const supabaseService = require('./supabaseService');
-                const activeBondingCurvesEvm = await supabaseService.getActiveBondingCurves('evm');
+                const activeBondingCurvesEvm = await supabaseService.getActiveBondingCurves(getEvmChainSlug());
                 const activeCount = activeBondingCurvesEvm.length;
                 const { getEventListener } = require('../eventListener');
                 const listener = getEventListener();
@@ -44,7 +45,7 @@ class CronService {
                 if (activeCount > listeningCount) {
                     console.log('[Cron] Mismatch detected, syncing EVM bonding curves...');
                     const tokenService = require('./tokenService');
-                    await tokenService.syncAllActiveBondingCurves('evm');
+                    await tokenService.syncAllActiveBondingCurves(getEvmChainSlug());
                 }
                 // If we have EVM listeners but provider is dead, force recycle
                 else if (activeCount > 0 && listeningCount > 0 && !listener.isRecycling) {

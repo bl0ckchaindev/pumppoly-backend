@@ -8,6 +8,9 @@ const router = express.Router();
 const tokenService = require('../services/tokenService');
 const { getEventListener } = require('../eventListener');
 const { virtualEthLpInitial, virtualTokenLpInitial, realEthLpInitial, realTokenLpInitial, bondingLimit } = require('../config');
+const { chainIdToSlug, CHAIN_ID_TO_SLUG } = require('../lib/chainUtils');
+
+const SUPPORTED_EVM_CHAIN_IDS = new Set(Object.keys(CHAIN_ID_TO_SLUG).map(Number));
 
 // EVM address validation
 function isValidEvmAddress(addr) {
@@ -21,12 +24,14 @@ function isValidTxHash(txHash) {
 /**
  * POST /tokens/register
  * Register an EVM token after on-chain creation.
- * Body: { chainId, transactionHash, tokenAddress, bondingCurveAddress, creator, name, symbol, description?, website?, twitter?, telegram?, blockNumber?, timestamp?, logoUrl?, bannerUrl? }
+ * Body: { chainId, chain?, transactionHash, tokenAddress, bondingCurveAddress, creator, name, symbol, description?, website?, twitter?, telegram?, blockNumber?, timestamp?, logoUrl?, bannerUrl? }
+ * Optional `chain` slug overrides mapping from chainId (e.g. polygon, bsc, base).
  */
 router.post('/tokens/register', async (req, res) => {
   try {
     const {
       chainId,
+      chain: chainBody,
       transactionHash,
       tokenAddress,
       bondingCurveAddress,
@@ -43,10 +48,11 @@ router.post('/tokens/register', async (req, res) => {
       bannerUrl
     } = req.body;
 
-    if (!chainId || (chainId !== 11155111 && chainId !== 8453 && chainId !== 84532)) {
+    const chainIdNum = chainId != null ? Number(chainId) : NaN;
+    if (!Number.isFinite(chainIdNum) || !SUPPORTED_EVM_CHAIN_IDS.has(chainIdNum)) {
       return res.status(400).json({
         success: false,
-        error: 'Invalid or unsupported chainId (use 11155111 for Sepolia, 8453 for Base, 84532 for Base Sepolia)'
+        error: `Invalid or unsupported chainId (supported: ${[...SUPPORTED_EVM_CHAIN_IDS].join(', ')})`
       });
     }
     if (!transactionHash || !isValidTxHash(transactionHash)) {
@@ -76,8 +82,13 @@ router.post('/tokens/register', async (req, res) => {
     const blockNum = blockNumber != null ? Number(blockNumber) : 0;
     const ts = timestamp != null ? Number(timestamp) : Math.floor(Date.now() / 1000);
 
+    const chainSlug =
+      typeof chainBody === 'string' && chainBody.trim()
+        ? chainBody.trim().toLowerCase()
+        : chainIdToSlug(chainIdNum);
+
     const tokenData = {
-      chain: 'evm',
+      chain: chainSlug,
       tokenAddress: tokenAddress.toLowerCase(),
       bondingCurveAddress: bondingCurveAddress.toLowerCase(),
       creator: creator.toLowerCase(),

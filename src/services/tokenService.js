@@ -1,4 +1,5 @@
 const supabaseService = require('./supabaseService');
+const { getEvmChainSlug, isEvmCompatibleChain } = require('../lib/chainUtils');
 const { getEventListener } = require('../eventListener');
 
 class TokenService {
@@ -39,7 +40,7 @@ class TokenService {
             } = tokenData;
 
             // Check if token already exists (with chain parameter for Solana)
-            const chain = tokenData.chain || 'evm';
+            const chain = tokenData.chain || getEvmChainSlug();
             let token = await supabaseService.getTokenByAddress(tokenAddress, chain);
             let bondingCurve = await supabaseService.getBondingCurveByAddress(bondingCurveAddress, chain);
 
@@ -56,7 +57,7 @@ class TokenService {
                 token = await supabaseService.createToken({
                     tokenAddress,
                     bondingCurveAddress,
-                    chain: tokenData.chain || 'evm',
+                    chain: tokenData.chain || getEvmChainSlug(),
                     creator,
                     name: String(name || ''),
                     symbol: String(symbol || ''),
@@ -83,7 +84,7 @@ class TokenService {
                 bondingCurve = await supabaseService.createBondingCurve({
                     bondingCurveAddress,
                     tokenAddress,
-                    chain: tokenData.chain || 'evm',
+                    chain: tokenData.chain || getEvmChainSlug(),
                     creator,
                     virtualEthLp: String(virtualEthLp || tokenData.virtualEthLp || '0'),
                     virtualTokenLp: String(virtualTokenLp || tokenData.virtualTokenLp || '0'),
@@ -96,14 +97,17 @@ class TokenService {
                     lpCreated: Boolean(tokenData.lpCreated || false),
                     startTimestamp: timestamp,
                     transactionHash,
-                    blockNumber
+                    blockNumber,
+                    liquidityLockDurationSeconds: tokenData.liquidityLockDurationSeconds,
+                    liquidityUnlockTimestamp: tokenData.liquidityUnlockTimestamp,
+                    lpUnlocked: tokenData.lpUnlocked
                 });
             }
 
             // Always ensure the bonding curve is being listened to (for new or existing)
             // This handles cases where the bonding curve exists but listener wasn't started
             // Only call for EVM - Solana has its own event listener
-            if (bondingCurve && bondingCurve.status === 'active' && chain === 'evm') {
+            if (bondingCurve && bondingCurve.status === 'active' && isEvmCompatibleChain(chain)) {
                 await this.ensureBondingCurveIsListened(bondingCurveAddress.toLowerCase());
             }
 

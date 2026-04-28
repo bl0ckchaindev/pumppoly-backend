@@ -1,6 +1,7 @@
 const express = require('express');
 const router = express.Router();
 const supabaseService = require('../services/supabaseService');
+const { getEvmChainSlug, isSolanaChain, isEvmCompatibleChain } = require('../lib/chainUtils');
 const solanaService = require('../services/solanaService');
 const evmService = require('../services/evmService');
 
@@ -34,7 +35,7 @@ function isValidEvmAddress(wallet) {
 function detectChain(wallet) {
     if (!wallet) return null;
     const trimmed = wallet.trim();
-    if (trimmed.startsWith('0x') && trimmed.length === 42) return 'evm';
+    if (trimmed.startsWith('0x') && trimmed.length === 42) return getEvmChainSlug();
     if (trimmed.length >= 32 && trimmed.length <= 44 && !trimmed.startsWith('0x')) return 'solana';
     return null;
 }
@@ -58,18 +59,18 @@ router.get('/trader-fee-claimable', async (req, res) => {
             chain = detectChain(wallet);
         }
         
-        if (chain === 'solana' && !isValidSolanaAddress(wallet)) {
+        if (isSolanaChain(chain) && !isValidSolanaAddress(wallet)) {
             return res.status(400).json({ error: 'Invalid Solana wallet address' });
         }
-        if (chain === 'evm' && !isValidEvmAddress(wallet)) {
+        if (isEvmCompatibleChain(chain) && !isValidEvmAddress(wallet)) {
             return res.status(400).json({ error: 'Invalid EVM wallet address' });
         }
         if (!chain) {
-            return res.status(400).json({ error: 'Unable to detect chain from wallet address. Please provide chain parameter (solana or evm)' });
+            return res.status(400).json({ error: 'Unable to detect chain from wallet address. Please provide chain parameter (e.g. solana, base, polygon)' });
         }
         
         // Normalize wallet address
-        const normalizedWallet = chain === 'evm' ? wallet.toLowerCase() : wallet;
+        const normalizedWallet = isEvmCompatibleChain(chain) ? wallet.toLowerCase() : wallet;
         
         // Get wallet's trader fees for this chain (trader_fees is one table; chain filter at DB)
         const chainRows = await supabaseService.getUnclaimedTraderFeesByWallet(normalizedWallet, chain);
@@ -80,7 +81,7 @@ router.get('/trader-fee-claimable', async (req, res) => {
                 walletAddress: normalizedWallet,
                 chain,
                 claimableAmount: '0',
-                claimableFormatted: chain === 'evm' ? '0.000000000000000000' : '0.000000000',
+                claimableFormatted: isEvmCompatibleChain(chain) ? '0.000000000000000000' : '0.000000000',
                 isCapped: false,
                 maxRewardPercentage: MAX_REWARD_PERCENTAGE,
                 count: 0
@@ -119,7 +120,7 @@ router.get('/trader-fee-claimable', async (req, res) => {
         }
         
         // Format based on chain (SOL = 9 decimals, ETH = 18 decimals)
-        const decimals = chain === 'evm' ? 18 : 9;
+        const decimals = isEvmCompatibleChain(chain) ? 18 : 9;
         const claimableFormatted = (Number(estimatedRewardAmount) / Math.pow(10, decimals)).toFixed(decimals);
         
         return res.json({
@@ -131,8 +132,8 @@ router.get('/trader-fee-claimable', async (req, res) => {
             maxRewardPercentage: MAX_REWARD_PERCENTAGE,
             // Legacy fields for backward compatibility (Solana)
             claimableLamports: estimatedRewardAmount.toString(),
-            claimableSol: chain === 'solana' ? claimableFormatted : undefined,
-            claimableEth: chain === 'evm' ? claimableFormatted : undefined,
+            claimableSol: isSolanaChain(chain) ? claimableFormatted : undefined,
+            claimableEth: isEvmCompatibleChain(chain) ? claimableFormatted : undefined,
             count: chainRows.length
         });
     } catch (error) {
@@ -160,24 +161,24 @@ router.get('/creator-fee-claimable', async (req, res) => {
             chain = detectChain(wallet);
         }
         
-        if (chain === 'solana' && !isValidSolanaAddress(wallet)) {
+        if (isSolanaChain(chain) && !isValidSolanaAddress(wallet)) {
             return res.status(400).json({ error: 'Invalid Solana wallet address' });
         }
-        if (chain === 'evm' && !isValidEvmAddress(wallet)) {
+        if (isEvmCompatibleChain(chain) && !isValidEvmAddress(wallet)) {
             return res.status(400).json({ error: 'Invalid EVM wallet address' });
         }
         if (!chain) {
-            return res.status(400).json({ error: 'Unable to detect chain from wallet address. Please provide chain parameter (solana or evm)' });
+            return res.status(400).json({ error: 'Unable to detect chain from wallet address. Please provide chain parameter (e.g. solana, base, polygon)' });
         }
         
         // Normalize wallet address
-        const normalizedWallet = chain === 'evm' ? wallet.toLowerCase() : wallet;
+        const normalizedWallet = isEvmCompatibleChain(chain) ? wallet.toLowerCase() : wallet;
         
         const tokens = await supabaseService.getTokensByCreatorWithFees(normalizedWallet, chain);
         const totalAmount = tokens.reduce((sum, t) => sum + BigInt(String(t.feeAmount || '0')), 0n);
         
         // Format based on chain (SOL = 9 decimals, ETH = 18 decimals)
-        const decimals = chain === 'evm' ? 18 : 9;
+        const decimals = isEvmCompatibleChain(chain) ? 18 : 9;
         const claimableFormatted = (Number(totalAmount) / Math.pow(10, decimals)).toFixed(decimals);
         
         return res.json({
@@ -187,8 +188,8 @@ router.get('/creator-fee-claimable', async (req, res) => {
             claimableFormatted,
             // Legacy fields for backward compatibility (Solana)
             claimableLamports: totalAmount.toString(),
-            claimableSol: chain === 'solana' ? claimableFormatted : undefined,
-            claimableEth: chain === 'evm' ? claimableFormatted : undefined,
+            claimableSol: isSolanaChain(chain) ? claimableFormatted : undefined,
+            claimableEth: isEvmCompatibleChain(chain) ? claimableFormatted : undefined,
             tokenCount: tokens.length
         });
     } catch (error) {
@@ -217,18 +218,18 @@ router.post('/claim-trader-fee', async (req, res) => {
             chain = detectChain(walletAddress);
         }
         
-        if (chain === 'solana' && !isValidSolanaAddress(walletAddress)) {
+        if (isSolanaChain(chain) && !isValidSolanaAddress(walletAddress)) {
             return res.status(400).json({ error: 'Invalid Solana wallet address' });
         }
-        if (chain === 'evm' && !isValidEvmAddress(walletAddress)) {
+        if (isEvmCompatibleChain(chain) && !isValidEvmAddress(walletAddress)) {
             return res.status(400).json({ error: 'Invalid EVM wallet address' });
         }
         if (!chain) {
-            return res.status(400).json({ error: 'Unable to detect chain from wallet address. Please provide chain parameter (solana or evm)' });
+            return res.status(400).json({ error: 'Unable to detect chain from wallet address. Please provide chain parameter (e.g. solana, base, polygon)' });
         }
         
         // Normalize wallet address
-        const normalizedWallet = chain === 'evm' ? walletAddress.toLowerCase() : walletAddress;
+        const normalizedWallet = isEvmCompatibleChain(chain) ? walletAddress.toLowerCase() : walletAddress;
 
         const chainRows = await supabaseService.getUnclaimedTraderFeesByWallet(normalizedWallet, chain);
         const totalAmount = chainRows.reduce((sum, r) => sum + BigInt(String(r.feeAmount || '0')), 0n);
@@ -239,9 +240,9 @@ router.post('/claim-trader-fee', async (req, res) => {
 
         // Pay based on chain
         let txHash;
-        if (chain === 'solana') {
+        if (isSolanaChain(chain)) {
             txHash = await solanaService.payTraderFeeClaim(normalizedWallet, totalAmount);
-        } else if (chain === 'evm') {
+        } else if (isEvmCompatibleChain(chain)) {
             txHash = await evmService.payTraderFeeClaim(normalizedWallet, totalAmount);
         } else {
             return res.status(400).json({ error: 'Invalid chain' });
@@ -251,20 +252,20 @@ router.post('/claim-trader-fee', async (req, res) => {
         await supabaseService.markTraderFeesAsClaimed(ids);
 
         // Format based on chain (SOL = 9 decimals, ETH = 18 decimals)
-        const decimals = chain === 'evm' ? 18 : 9;
+        const decimals = isEvmCompatibleChain(chain) ? 18 : 9;
         const claimableFormatted = (Number(totalAmount) / Math.pow(10, decimals)).toFixed(decimals);
         
         return res.json({
             success: true,
             chain,
             transactionHash: txHash,
-            transactionSignature: chain === 'solana' ? txHash : undefined, // Legacy field
+            transactionSignature: isSolanaChain(chain) ? txHash : undefined, // Legacy field
             amount: totalAmount.toString(),
             amountFormatted: claimableFormatted,
             // Legacy fields
             amountLamports: totalAmount.toString(),
-            amountSol: chain === 'solana' ? claimableFormatted : undefined,
-            amountEth: chain === 'evm' ? claimableFormatted : undefined,
+            amountSol: isSolanaChain(chain) ? claimableFormatted : undefined,
+            amountEth: isEvmCompatibleChain(chain) ? claimableFormatted : undefined,
             walletAddress: normalizedWallet
         });
     } catch (error) {

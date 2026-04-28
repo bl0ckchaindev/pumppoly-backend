@@ -1,6 +1,7 @@
 const ethers = require("ethers");
 const { httpRpcUrl, wsRpcUrl, virtualEthLpInitial, virtualTokenLpInitial, realEthLpInitial, realTokenLpInitial, bondingLimit } = require('./config');
 const supabaseService = require('./services/supabaseService');
+const { getEvmChainSlug } = require('./lib/chainUtils');
 
 // Load full ABIs from JSON files
 const FACTORY_ABI = require('./abi/FactoryABI.json');
@@ -204,6 +205,7 @@ class EventListener {
                 telegram,
                 timestamp,
                 blockNumber,
+                liquidityLockDuration,
                 event
             ) => {
                 console.log(`\n🎉 New token created!`);
@@ -228,6 +230,7 @@ class EventListener {
                     telegram,
                     timestamp,
                     blockNumber,
+                    liquidityLockDuration,
                     event
                 );
             });
@@ -262,12 +265,16 @@ class EventListener {
         telegram,
         timestamp,
         blockNumber,
+        liquidityLockDuration,
         event
     ) {
         try {
             // Convert BigNumber values to numbers/strings
             const blockNumberNum = blockNumber && blockNumber.toNumber ? blockNumber.toNumber() : Number(blockNumber);
             const timestampNum = timestamp && timestamp.toNumber ? timestamp.toNumber() : Number(timestamp);
+            const lockDur = liquidityLockDuration != null && liquidityLockDuration.toString
+                ? liquidityLockDuration.toString()
+                : (liquidityLockDuration != null ? String(liquidityLockDuration) : '');
             
             // Get block timestamp as fallback if event timestamp is invalid
             let finalTimestamp = timestampNum;
@@ -318,7 +325,8 @@ class EventListener {
                 k: String(k),
                 tokenStartPrice: '0',
                 volume: '0',
-                lpCreated: BigInt(realEthLp) >= BigInt(bondingLimit || '0')
+                lpCreated: BigInt(realEthLp) >= BigInt(bondingLimit || '0'),
+                liquidityLockDurationSeconds: lockDur || undefined
             };
 
             // Save token and bonding curve to database
@@ -683,7 +691,7 @@ class EventListener {
                 await supabaseService.insertTraderFee({
                     walletAddress: traderLower,
                     mint: tokenAddressLower,
-                    chain: 'evm',
+                    chain: getEvmChainSlug(),
                     tradeType: tradeType,
                     platformFee: platformFee.toString(),
                     creatorFee: creatorFee.toString(),
@@ -696,7 +704,7 @@ class EventListener {
                 // Accumulate creator fee for this token (for creator distribution at round end)
                 if (creatorFee && BigInt(creatorFee.toString()) > 0n) {
                     try {
-                        await supabaseService.incrementTokenCreatorFee(tokenAddressLower, 'evm', creatorFee.toString());
+                        await supabaseService.incrementTokenCreatorFee(tokenAddressLower, getEvmChainSlug(), creatorFee.toString());
                     } catch (incErr) {
                         console.error('  ⚠ Failed to increment token creator fee:', incErr.message);
                     }
@@ -760,7 +768,7 @@ class EventListener {
                 isBuy,
                 transactionHash: (typeof event.transactionHash === 'string' ? event.transactionHash.toLowerCase() : event.transactionHash),
                 blockNumber: eventBlockNumber,
-                chain: 'evm'
+                chain: getEvmChainSlug()
             };
 
             // Try to insert price data (returns null if duplicate)
@@ -784,7 +792,7 @@ class EventListener {
                 transactionHash: (typeof event.transactionHash === 'string' ? event.transactionHash.toLowerCase() : event.transactionHash),
                 blockNumber: eventBlockNumber,
                 timestamp: timestampNum,
-                chain: 'evm'
+                chain: getEvmChainSlug()
             };
 
             try {
@@ -927,7 +935,7 @@ class EventListener {
                     }
                     
                     for (const event of events) {
-                        const [tokenAddress, bondingCurveAddress, creator, name, symbol, description, website, twitter, telegram, timestamp, blockNumber] = event.args;
+                        const [tokenAddress, bondingCurveAddress, creator, name, symbol, description, website, twitter, telegram, timestamp, blockNumber, liquidityLockDuration] = event.args;
                         
                         // Convert BigNumber to number
                         const blockNumberNum = blockNumber && blockNumber.toNumber ? blockNumber.toNumber() : Number(blockNumber);
@@ -948,6 +956,7 @@ class EventListener {
                                 telegram,
                                 timestampNum,
                                 blockNumberNum,
+                                liquidityLockDuration,
                                 event
                             );
                             totalEvents++;
@@ -1090,7 +1099,7 @@ class EventListener {
                 
                 for (const event of events) {
                     const txHash = typeof event.transactionHash === 'string' ? event.transactionHash.toLowerCase() : event.transactionHash;
-                    if (await supabaseService.checkPriceDataExists(txHash, 'evm')) continue;
+                    if (await supabaseService.checkPriceDataExists(txHash, getEvmChainSlug())) continue;
                     const [tokenAddress, timestamp, openPrice, closePrice, amount, tokenAmount, trader, isBuy] = event.args;
                     await this.handleTokenTradedEvent(
                         bondingCurveAddress,
@@ -1109,7 +1118,7 @@ class EventListener {
                 
                 for (const event of traderFeeEvents) {
                     const txHash = typeof event.transactionHash === 'string' ? event.transactionHash.toLowerCase() : event.transactionHash;
-                    if (await supabaseService.checkTraderFeeExists(txHash, 'evm')) continue;
+                    if (await supabaseService.checkTraderFeeExists(txHash, getEvmChainSlug())) continue;
                     const [trader, tokenAddress, tradeType, platformFee, creatorFee, feeAmount] = event.args;
                     await this.handleTraderFeeEvent(
                         bondingCurveAddress,
@@ -1146,7 +1155,7 @@ class EventListener {
         try {
             const tokenService = require('./services/tokenService');
             // Only EVM bonding curves — Solana has its own event listener
-            const activeBondingCurves = await supabaseService.getActiveBondingCurves('evm');
+            const activeBondingCurves = await supabaseService.getActiveBondingCurves(getEvmChainSlug());
             
             console.log(`Reconnecting ${activeBondingCurves.length} bonding curve listener(s)...`);
             
@@ -1303,7 +1312,7 @@ class EventListener {
                         for (const event of events) {
                             try {
                                 const txHash = typeof event.transactionHash === 'string' ? event.transactionHash.toLowerCase() : event.transactionHash;
-                                if (await supabaseService.checkPriceDataExists(txHash, 'evm')) {
+                                if (await supabaseService.checkPriceDataExists(txHash, getEvmChainSlug())) {
                                     const ebSkip = typeof event.blockNumber === 'number' ? event.blockNumber : Number(event.blockNumber);
                                     if (ebSkip > maxProcessedBlock) maxProcessedBlock = ebSkip;
                                     continue;
@@ -1331,7 +1340,7 @@ class EventListener {
                         for (const event of traderFeeEvents) {
                             try {
                                 const txHash = typeof event.transactionHash === 'string' ? event.transactionHash.toLowerCase() : event.transactionHash;
-                                if (await supabaseService.checkTraderFeeExists(txHash, 'evm')) {
+                                if (await supabaseService.checkTraderFeeExists(txHash, getEvmChainSlug())) {
                                     const ebSkip = typeof event.blockNumber === 'number' ? event.blockNumber : Number(event.blockNumber);
                                     if (ebSkip > maxProcessedBlock) maxProcessedBlock = ebSkip;
                                     continue;
@@ -1563,7 +1572,7 @@ class EventListener {
                     } else if (parsedLog.name === 'TraderFee') {
                         if (traderFeeTopic && log.topics && log.topics[0] !== traderFeeTopic) continue;
                         const txHash = (receipt.transactionHash || '').toLowerCase();
-                        if (await supabaseService.checkTraderFeeExists(txHash, 'evm')) continue;
+                        if (await supabaseService.checkTraderFeeExists(txHash, getEvmChainSlug())) continue;
                         const [trader, tokenAddress, tradeType, platformFee, creatorFee, feeAmount] = parsedLog.args;
                         const eventObj = {
                             transactionHash: receipt.transactionHash,

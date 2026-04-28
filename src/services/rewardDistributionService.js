@@ -18,6 +18,7 @@
 const supabaseService = require('./supabaseService');
 const solanaService = require('./solanaService');
 const evmService = require('./evmService');
+const { isSolanaChain, isEvmCompatibleChain } = require('../lib/chainUtils');
 
 const ROUND_MS_5MIN = 5 * 60 * 1000;
 
@@ -58,7 +59,7 @@ class RewardDistributionService {
      * 3. Send native token (SOL/ETH) from treasury to each trader (above minimum threshold)
      * 4. Initialize trader_fees: delete rows where created_at < distribution time (this round's data)
      * 5. Set next_distribution_at = distribution_time + round length (next round end)
-     * @param {string} chain - 'solana' | 'evm'
+     * @param {string} chain - e.g. 'solana' | 'base' | 'polygon' | 'bsc' | 'eth'
      */
     async runDistributionForChain(chain) {
         const distributionAt = new Date();
@@ -143,7 +144,7 @@ class RewardDistributionService {
         }
 
         // Chain-specific operations
-        if (chain === 'solana') {
+        if (isSolanaChain(chain)) {
             // Solana: claim protocol fees from vault first
             if (payouts.length > 0) {
                 try {
@@ -158,8 +159,8 @@ class RewardDistributionService {
                     console.error(`[RewardDistribution:${chainLabel}] Failed to ensure owner WSOL ATA:`, err.message);
                 }
             }
-        } else if (chain === 'evm') {
-            // EVM: ensure evmService is initialized
+        } else if (isEvmCompatibleChain(chain)) {
+            // EVM-family: ensure evmService is initialized (same RPC/treasury for this deployment)
             try {
                 await evmService.initialize();
             } catch (err) {
@@ -174,9 +175,9 @@ class RewardDistributionService {
         // Pay traders
         for (const { walletAddress, amount } of payouts) {
             try {
-                if (chain === 'solana') {
+                if (isSolanaChain(chain)) {
                     await solanaService.payTraderFeeClaim(walletAddress, amount);
-                } else if (chain === 'evm') {
+                } else if (isEvmCompatibleChain(chain)) {
                     await evmService.payTraderFeeClaim(walletAddress, amount);
                 }
                 successCount++;
@@ -193,9 +194,9 @@ class RewardDistributionService {
             const amount = BigInt(feeAmount);
             if (amount <= 0n) continue;
             try {
-                if (chain === 'solana') {
+                if (isSolanaChain(chain)) {
                     await solanaService.payTraderFeeClaim(creator, amount);
-                } else if (chain === 'evm') {
+                } else if (isEvmCompatibleChain(chain)) {
                     await evmService.payTraderFeeClaim(creator, amount);
                 }
                 await supabaseService.resetTokenCreatorFee(tokenAddress, chain);
@@ -244,24 +245,32 @@ class RewardDistributionService {
         const { cycle, rewardRatio } = config;
         const cycleMs = this.getCycleMs(cycle);
 
-        // Run distribution for both chains
-        const solanaResult = await this.runDistributionForChain('solana');
-        const evmResult = await this.runDistributionForChain('evm');
+        const chainList = await supabaseService.getChainsToDistribute();
+        const byChain = {};
+        for (const c of chainList) {
+            byChain[c] = await this.runDistributionForChain(c);
+        }
 
-        // Clean up trader_fees for both chains
-        const deletedSolana = await supabaseService.deleteTraderFeesOlderThan(distributionAtIso, 'solana');
-        const deletedEvm = await supabaseService.deleteTraderFeesOlderThan(distributionAtIso, 'evm');
-        const totalDeleted = deletedSolana + deletedEvm;
+        let totalDeleted = 0;
+        for (const c of chainList) {
+            totalDeleted += await supabaseService.deleteTraderFeesOlderThan(distributionAtIso, c);
+        }
 
         // Advance to next round
         const nextAt = new Date(distributionAt.getTime() + cycleMs);
         await supabaseService.updateRewardDistributionConfig({ nextDistributionAt: nextAt.toISOString() });
 
         // Log distribution run (combined stats)
-        const totalFees = BigInt(solanaResult.totalFeesAmount || '0') + BigInt(evmResult.totalFeesAmount || '0');
-        const totalRewards = BigInt(solanaResult.totalRewardsAmount || '0') + BigInt(evmResult.totalRewardsAmount || '0');
-        const totalPaidCount = (solanaResult.paidCount || 0) + (evmResult.paidCount || 0);
-        const totalFailCount = (solanaResult.failCount || 0) + (evmResult.failCount || 0);
+        let totalFees = 0n;
+        let totalRewards = 0n;
+        let totalPaidCount = 0;
+        let totalFailCount = 0;
+        for (const r of Object.values(byChain)) {
+            totalFees += BigInt(r.totalFeesAmount || '0');
+            totalRewards += BigInt(r.totalRewardsAmount || '0');
+            totalPaidCount += r.paidCount || 0;
+            totalFailCount += r.failCount || 0;
+        }
 
         try {
             await supabaseService.insertRewardDistributionRun({
@@ -279,18 +288,22 @@ class RewardDistributionService {
             console.error('[RewardDistribution] Failed to log run:', err.message);
         }
 
+        const chainSummary = chainList
+            .map((c) => {
+                const r = byChain[c] || {};
+                return `${c}(paid:${r.paidCount || 0},fail:${r.failCount || 0})`;
+            })
+            .join('; ');
         console.log(
-            `[RewardDistribution] Round finished at ${distributionAtIso}: ` +
-            `Solana (paid: ${solanaResult.paidCount || 0}, failed: ${solanaResult.failCount || 0}), ` +
-            `EVM (paid: ${evmResult.paidCount || 0}, failed: ${evmResult.failCount || 0}); ` +
+            `[RewardDistribution] Round finished at ${distributionAtIso}: ${chainSummary}; ` +
             `deleted ${totalDeleted} trader_fees rows; next at ${nextAt.toISOString()}`
         );
 
         return {
             ok: true,
             distributionAt: distributionAtIso,
-            solana: solanaResult,
-            evm: evmResult,
+            byChain,
+            chains: chainList,
             deletedRows: totalDeleted,
             nextAt: nextAt.toISOString()
         };

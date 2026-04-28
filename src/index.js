@@ -131,6 +131,7 @@ app.use(generalLimiter);
 const routes = require('./routes');
 const { getEventListener } = require('./eventListener');
 const { contractAddr } = require('./config');
+const { getEvmChainSlug } = require('./lib/chainUtils');
 
 const port = process.env.PORT || 3010
 
@@ -175,14 +176,14 @@ async function initializeServices(retries = 3, delay = 5000) {
             // Step 2: Start listening to existing active bonding curves (EVM)
             console.log('Step 2: Starting listeners for existing EVM bonding curves...');
             try {
-                const syncResult = await tokenService.syncAllActiveBondingCurves('evm');
+                const syncResult = await tokenService.syncAllActiveBondingCurves(getEvmChainSlug());
                 console.log(`✓ Started listening to ${syncResult.started} EVM bonding curve(s)`);
                 if (syncResult.failed > 0) {
                     console.log(`  ⚠ Failed to start ${syncResult.failed} listener(s)`);
                 }
             } catch (error) {
                 console.error('✗ Error syncing EVM bonding curves:', error.message);
-                console.log('  ⚠ Make sure you have run the database migration: supabase-migration-solana.sql');
+                console.log('  ⚠ Make sure you have run the database migration: supabase-migration-multi-chain.sql');
                 // Don't fail startup if this fails
             }
 

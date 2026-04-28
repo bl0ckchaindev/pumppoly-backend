@@ -413,7 +413,11 @@ class SolanaService {
                 realQuoteReserves: account.realQuoteReserves.toNumber(),
                 virtualQuoteReserves: account.virtualQuoteReserves.toNumber(),
                 totalSupply: account.totalSupply.toNumber(),
-                complete: account.complete
+                complete: account.complete,
+                liquidityLockSecs: account.liquidityLockSecs?.toNumber?.() ?? null,
+                liquidityUnlockTs: account.liquidityUnlockTs?.toNumber?.() ?? null,
+                poolLpMint: account.poolLpMint?.toString?.() ?? null,
+                lpUnlocked: Boolean(account.lpUnlocked)
             };
         } catch (error) {
             return null;

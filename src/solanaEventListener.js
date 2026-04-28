@@ -26,7 +26,8 @@ const EVENT_DISCRIMINATORS = {
     CREATE: [96, 6, 69, 34, 20, 216, 249, 240],
     TRADE: [230, 70, 166, 249, 243, 37, 141, 112],
     COMPLETE: [39, 6, 3, 104, 12, 154, 133, 7],
-    TRADER_FEE: [211, 72, 153, 86, 46, 196, 23, 17]
+    TRADER_FEE: [211, 72, 153, 86, 46, 196, 23, 17],
+    LP_UNLOCKED: [83, 10, 33, 140, 182, 48, 201, 137]
 };
 
 class SolanaEventListener {
@@ -313,6 +314,8 @@ class SolanaEventListener {
                     await this.handleCompleteEvent(event.data, transaction, signature);
                 } else if (event.name === 'TRADER_FEE') {
                     await this.handleTraderFeeEvent(event.data, transaction, signature);
+                } else if (event.name === 'LP_UNLOCKED') {
+                    await this.handleLpUnlockedEvent(event.data, transaction, signature);
                 }
             }
 
@@ -374,6 +377,8 @@ class SolanaEventListener {
                             await this.parseCompleteEvent(eventData, transaction, signature);
                         } else if (this.arrayEquals(discriminator, EVENT_DISCRIMINATORS.TRADER_FEE)) {
                             await this.parseTraderFeeEvent(eventData, transaction, signature);
+                        } else if (this.arrayEquals(discriminator, EVENT_DISCRIMINATORS.LP_UNLOCKED)) {
+                            await this.parseLpUnlockedEvent(eventData, transaction, signature);
                         }
                     } catch (parseError) {
                         // Not an event, continue
@@ -401,6 +406,8 @@ class SolanaEventListener {
                                 await this.parseCompleteEvent(eventData, transaction, signature);
                             } else if (this.arrayEquals(discriminator, EVENT_DISCRIMINATORS.TRADER_FEE)) {
                                 await this.parseTraderFeeEvent(eventData, transaction, signature);
+                            } else if (this.arrayEquals(discriminator, EVENT_DISCRIMINATORS.LP_UNLOCKED)) {
+                                await this.parseLpUnlockedEvent(eventData, transaction, signature);
                             }
                         } catch (parseError) {
                             // Not an event, continue
@@ -429,6 +436,9 @@ class SolanaEventListener {
             const symbol = eventData.symbol || '';
             const decimals = eventData.decimals || 6;
             const uri = eventData.uri || '';
+            const liquidityLockSecs = eventData.liquidityLockSecs != null
+                ? Number(eventData.liquidityLockSecs)
+                : (eventData.liquidity_lock_secs != null ? Number(eventData.liquidity_lock_secs) : null);
 
             // Check if token already exists
             const existingToken = await supabaseService.getTokenByAddress(mint, 'solana');
@@ -479,7 +489,10 @@ class SolanaEventListener {
                 k: '32190000000000000000', // k = virtual_eth_lp * virtual_token_lp = 30_000_000_000 * 1_073_000_000_000_000
                 tokenStartPrice: '0',
                 volume: '0',
-                lpCreated: false
+                lpCreated: false,
+                liquidityLockDurationSeconds: liquidityLockSecs != null && !Number.isNaN(liquidityLockSecs)
+                    ? String(liquidityLockSecs)
+                    : undefined
             });
 
             console.log(`✓ Processed Solana CREATE event: ${mint} (${name})`);
@@ -530,6 +543,12 @@ class SolanaEventListener {
             const uriLength = eventData.readUInt32LE(offset);
             offset += 4;
             const uri = eventData.slice(offset, offset + uriLength).toString('utf8');
+            offset += uriLength;
+
+            let liquidityLockSecs = 0;
+            if (eventData.length >= offset + 8) {
+                liquidityLockSecs = Number(eventData.readBigUInt64LE(offset));
+            }
 
             await this.handleCreateEvent({
                 creator,
@@ -537,7 +556,8 @@ class SolanaEventListener {
                 name,
                 symbol,
                 decimals,
-                uri
+                uri,
+                liquidityLockSecs
             }, transaction, signature);
         } catch (error) {
             console.error('✗ Error parsing CREATE event:', error.message);
@@ -845,12 +865,17 @@ class SolanaEventListener {
 
             console.log(`  📝 Updating bonding curve status to completed: ${bondingCurveAddress}`);
 
+            const unlockTs = eventData.liquidity_unlock_ts != null
+                ? Number(eventData.liquidity_unlock_ts)
+                : (eventData.liquidityUnlockTs != null ? Number(eventData.liquidityUnlockTs) : null);
+
             // Update bonding curve status
             try {
                 await supabaseService.updateBondingCurve(bondingCurveAddress, {
                     chain: 'solana', // Required for address normalization
                     lpCreated: true,
-                    status: 'completed'
+                    status: 'completed',
+                    ...(unlockTs != null && !Number.isNaN(unlockTs) ? { liquidityUnlockTimestamp: unlockTs } : {})
                 });
                 console.log(`  ✅ Bonding curve status updated to completed`);
             } catch (updateError) {
@@ -873,6 +898,61 @@ class SolanaEventListener {
     }
 
     /**
+     * Handle LP_UNLOCKED (creator or migrator received Raydium LP tokens)
+     */
+    async handleLpUnlockedEvent(eventData, transaction, signature) {
+        try {
+            const mint = eventData.mint
+                ? (typeof eventData.mint === 'string' ? eventData.mint : new PublicKey(eventData.mint).toString())
+                : eventData.mint.toString();
+
+            const [bondingCurvePubkey] = PublicKey.findProgramAddressSync(
+                [Buffer.from(BONDING_CURVE_SEED), new PublicKey(mint).toBuffer()],
+                PROGRAM_ID
+            );
+            const bondingCurveAddress = bondingCurvePubkey.toString();
+
+            const bondingCurve = await supabaseService.getBondingCurveByAddress(bondingCurveAddress, 'solana');
+            if (!bondingCurve) {
+                console.log(`  ⚠ Bonding curve not found for LP_UNLOCKED ${mint}`);
+                return;
+            }
+
+            await supabaseService.updateBondingCurve(bondingCurveAddress, {
+                chain: 'solana',
+                lpUnlocked: true
+            });
+            console.log(`✓ Processed LP_UNLOCKED for ${mint} (sig ${signature?.slice?.(0, 8) || ''}…)`);
+        } catch (error) {
+            console.error('✗ Error handling LP_UNLOCKED event:', error.message);
+            throw error;
+        }
+    }
+
+    /**
+     * Parse LP_UNLOCKED from binary (Anchor event)
+     */
+    async parseLpUnlockedEvent(eventData, transaction, signature) {
+        try {
+            let offset = 8;
+            const mint = new PublicKey(eventData.slice(offset, offset + 32));
+            offset += 32;
+            const migrator = new PublicKey(eventData.slice(offset, offset + 32));
+            offset += 32;
+            const amount = eventData.readBigUInt64LE(offset);
+
+            await this.handleLpUnlockedEvent({
+                mint,
+                migrator,
+                amount: amount.toString()
+            }, transaction, signature);
+        } catch (error) {
+            console.error('✗ Error parsing LP_UNLOCKED event:', error.message);
+            throw error;
+        }
+    }
+
+    /**
      * Parse COMPLETE event manually from binary data
      */
     async parseCompleteEvent(eventData, transaction, signature) {
@@ -889,11 +969,18 @@ class SolanaEventListener {
             
             // Parse pool (32 bytes)
             const pool = new PublicKey(eventData.slice(offset, offset + 32));
+            offset += 32;
+
+            let liquidityUnlockTs = null;
+            if (eventData.length >= offset + 8) {
+                liquidityUnlockTs = Number(eventData.readBigInt64LE(offset));
+            }
 
             await this.handleCompleteEvent({
                 mint,
                 lp_mint: lpMint,
-                pool
+                pool,
+                liquidity_unlock_ts: liquidityUnlockTs
             }, transaction, signature);
         } catch (error) {
             console.error('✗ Error parsing COMPLETE event:', error.message);

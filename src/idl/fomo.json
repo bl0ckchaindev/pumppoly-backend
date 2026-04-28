@@ -1978,6 +1978,10 @@
           "writable": true
         },
         {
+          "name": "bonding_curve_lp_token",
+          "writable": true
+        },
+        {
           "name": "cpmm_token_0_vault",
           "writable": true,
           "pda": {
@@ -2075,6 +2079,66 @@
         {
           "name": "rent",
           "address": "SysvarRent111111111111111111111111111111111"
+        }
+      ],
+      "args": []
+    },
+    {
+      "name": "unlock_lp",
+      "discriminator": [
+        23,
+        204,
+        171,
+        107,
+        47,
+        88,
+        205,
+        53
+      ],
+      "accounts": [
+        {
+          "name": "migrator",
+          "writable": true,
+          "signer": true
+        },
+        {
+          "name": "global_config",
+          "writable": true
+        },
+        {
+          "name": "bonding_curve",
+          "writable": true
+        },
+        {
+          "name": "bonding_curve_authority"
+        },
+        {
+          "name": "base_mint",
+          "writable": true
+        },
+        {
+          "name": "lp_mint",
+          "writable": true
+        },
+        {
+          "name": "bonding_curve_lp_token",
+          "writable": true
+        },
+        {
+          "name": "migrator_lp_token",
+          "writable": true
+        },
+        {
+          "name": "token_program",
+          "address": "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"
+        },
+        {
+          "name": "associated_token_program",
+          "address": "ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL"
+        },
+        {
+          "name": "system_program",
+          "address": "11111111111111111111111111111111"
         }
       ],
       "args": []
@@ -2714,6 +2778,19 @@
         23,
         17
       ]
+    },
+    {
+      "name": "LP_UNLOCKED",
+      "discriminator": [
+        83,
+        10,
+        33,
+        140,
+        182,
+        48,
+        201,
+        137
+      ]
     }
   ],
   "errors": [
@@ -2781,6 +2858,31 @@
       "code": 6012,
       "name": "BondingCurveNotOpen",
       "msg": "Bonding curve is not open"
+    },
+    {
+      "code": 6013,
+      "name": "InvalidLiquidityLock",
+      "msg": "LP lock duration must be at least 30 days"
+    },
+    {
+      "code": 6014,
+      "name": "LpLockNotExpired",
+      "msg": "LP is still locked"
+    },
+    {
+      "code": 6015,
+      "name": "LpAlreadyUnlocked",
+      "msg": "LP has already been unlocked"
+    },
+    {
+      "code": 6016,
+      "name": "InvalidLpVault",
+      "msg": "Invalid LP token vault account"
+    },
+    {
+      "code": 6017,
+      "name": "NoLpToUnlock",
+      "msg": "No LP tokens to unlock"
     }
   ],
   "types": [
@@ -2913,6 +3015,22 @@
           {
             "name": "complete",
             "type": "bool"
+          },
+          {
+            "name": "liquidity_lock_secs",
+            "type": "u64"
+          },
+          {
+            "name": "liquidity_unlock_ts",
+            "type": "i64"
+          },
+          {
+            "name": "pool_lp_mint",
+            "type": "pubkey"
+          },
+          {
+            "name": "lp_unlocked",
+            "type": "bool"
           }
         ]
       }
@@ -2949,6 +3067,10 @@
           {
             "name": "pool",
             "type": "pubkey"
+          },
+          {
+            "name": "liquidity_unlock_ts",
+            "type": "i64"
           }
         ]
       }
@@ -2981,6 +3103,10 @@
           {
             "name": "uri",
             "type": "string"
+          },
+          {
+            "name": "liquidity_lock_secs",
+            "type": "u64"
           }
         ]
       }
@@ -3004,6 +3130,10 @@
           },
           {
             "name": "open_time",
+            "type": "u64"
+          },
+          {
+            "name": "liquidity_lock_secs",
             "type": "u64"
           }
         ]

@@ -1,6 +1,7 @@
 const ethers = require("ethers");
 const { httpRpcUrl } = require('../config');
 const supabaseService = require('./supabaseService');
+const { getEvmChainSlug } = require('../lib/chainUtils');
 const tokenService = require('./tokenService');
 
 // Load full ABI from JSON file
@@ -126,7 +127,7 @@ class CatchUpService {
                     for (const event of traderFeeEvents) {
                         try {
                             const txHash = typeof event.transactionHash === 'string' ? event.transactionHash.toLowerCase() : event.transactionHash;
-                            if (await supabaseService.checkTraderFeeExists(txHash, 'evm')) continue;
+                            if (await supabaseService.checkTraderFeeExists(txHash, getEvmChainSlug())) continue;
                             await this.processTraderFeeEvent(contractAddress, event);
                             totalTraderFees++;
                         } catch (err) {
@@ -188,7 +189,7 @@ class CatchUpService {
         await supabaseService.insertTraderFee({
             walletAddress: traderLower,
             mint: tokenAddressLower,
-            chain: 'evm',
+            chain: getEvmChainSlug(),
             tradeType: tradeType,
             platformFee: platformFee.toString(),
             creatorFee: creatorFee.toString(),
@@ -199,7 +200,7 @@ class CatchUpService {
         });
         if (creatorFee && BigInt(creatorFee.toString()) > 0n) {
             try {
-                await supabaseService.incrementTokenCreatorFee(tokenAddressLower, 'evm', creatorFee.toString());
+                await supabaseService.incrementTokenCreatorFee(tokenAddressLower, getEvmChainSlug(), creatorFee.toString());
             } catch (incErr) {
                 console.error('  Failed to increment token creator fee:', incErr.message);
             }
@@ -216,7 +217,7 @@ class CatchUpService {
 
             // Check if event already exists (normalize tx hash for EVM)
             const txHash = typeof event.transactionHash === 'string' ? event.transactionHash.toLowerCase() : event.transactionHash;
-            const exists = await supabaseService.checkPriceDataExists(txHash, 'evm');
+            const exists = await supabaseService.checkPriceDataExists(txHash, getEvmChainSlug());
 
             if (exists) {
                 return; // Already processed
@@ -250,7 +251,7 @@ class CatchUpService {
                 isBuy,
                 transactionHash: event.transactionHash,
                 blockNumber: event.blockNumber,
-                chain: 'evm'
+                chain: getEvmChainSlug()
             };
 
             await supabaseService.addTokenPriceData(priceData);
@@ -270,7 +271,7 @@ class CatchUpService {
                         transactionHash: event.transactionHash,
                         blockNumber: event.blockNumber,
                         timestamp: timestamp.toNumber(),
-                        chain: 'evm'
+                        chain: getEvmChainSlug()
                     };
                     await supabaseService.addTradeHistory(tradeData);
                 }
@@ -321,7 +322,7 @@ class CatchUpService {
             }
 
             // Only EVM bonding curves — Solana has its own event listener
-            const activeBondingCurvesData = await supabaseService.getActiveBondingCurves('evm');
+            const activeBondingCurvesData = await supabaseService.getActiveBondingCurves(getEvmChainSlug());
             const activeBondingCurves = activeBondingCurvesData.map(bc => ({
                 bondingCurveAddress: bc.bondingCurveAddress
             }));
