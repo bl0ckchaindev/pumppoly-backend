@@ -1,5 +1,5 @@
 {
-  "address": "H9puYYy1pzfz4munVYoNTWWLAoeAP78Atfq6EKbTmKKf",
+  "address": "Cnv3635XeU9j44qjLxLGednXWKewurNyqwfXrD8XbzVQ",
   "metadata": {
     "name": "fomo",
     "version": "0.1.0",
@@ -2084,66 +2084,6 @@
       "args": []
     },
     {
-      "name": "unlock_lp",
-      "discriminator": [
-        23,
-        204,
-        171,
-        107,
-        47,
-        88,
-        205,
-        53
-      ],
-      "accounts": [
-        {
-          "name": "migrator",
-          "writable": true,
-          "signer": true
-        },
-        {
-          "name": "global_config",
-          "writable": true
-        },
-        {
-          "name": "bonding_curve",
-          "writable": true
-        },
-        {
-          "name": "bonding_curve_authority"
-        },
-        {
-          "name": "base_mint",
-          "writable": true
-        },
-        {
-          "name": "lp_mint",
-          "writable": true
-        },
-        {
-          "name": "bonding_curve_lp_token",
-          "writable": true
-        },
-        {
-          "name": "migrator_lp_token",
-          "writable": true
-        },
-        {
-          "name": "token_program",
-          "address": "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"
-        },
-        {
-          "name": "associated_token_program",
-          "address": "ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL"
-        },
-        {
-          "name": "system_program",
-          "address": "11111111111111111111111111111111"
-        }
-      ],
-      "args": []
-    },
-    {
       "name": "sell",
       "discriminator": [
         51,
@@ -2626,6 +2566,239 @@
       ]
     },
     {
+      "name": "unlock_lp",
+      "discriminator": [
+        23,
+        204,
+        171,
+        107,
+        47,
+        88,
+        205,
+        53
+      ],
+      "accounts": [
+        {
+          "name": "migrator",
+          "docs": [
+            "Platform migrator or token creator (`bonding_curve.owner`); receives LP tokens"
+          ],
+          "writable": true,
+          "signer": true
+        },
+        {
+          "name": "global_config",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  103,
+                  108,
+                  111,
+                  98,
+                  97,
+                  108,
+                  95,
+                  99,
+                  111,
+                  110,
+                  102,
+                  105,
+                  103
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "name": "bonding_curve",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  98,
+                  111,
+                  110,
+                  100,
+                  105,
+                  110,
+                  103,
+                  95,
+                  99,
+                  117,
+                  114,
+                  118,
+                  101
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "base_mint"
+              }
+            ]
+          }
+        },
+        {
+          "name": "bonding_curve_authority",
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  98,
+                  111,
+                  110,
+                  100,
+                  105,
+                  110,
+                  103,
+                  95,
+                  99,
+                  117,
+                  114,
+                  118,
+                  101,
+                  95,
+                  97,
+                  117,
+                  116,
+                  104,
+                  111,
+                  114,
+                  105,
+                  116,
+                  121
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "base_mint"
+              }
+            ]
+          }
+        },
+        {
+          "name": "base_mint",
+          "writable": true
+        },
+        {
+          "name": "lp_mint",
+          "writable": true
+        },
+        {
+          "name": "bonding_curve_lp_token",
+          "writable": true
+        },
+        {
+          "name": "migrator_lp_token",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "account",
+                "path": "migrator"
+              },
+              {
+                "kind": "const",
+                "value": [
+                  6,
+                  221,
+                  246,
+                  225,
+                  215,
+                  101,
+                  161,
+                  147,
+                  217,
+                  203,
+                  225,
+                  70,
+                  206,
+                  235,
+                  121,
+                  172,
+                  28,
+                  180,
+                  133,
+                  237,
+                  95,
+                  91,
+                  55,
+                  145,
+                  58,
+                  140,
+                  245,
+                  133,
+                  126,
+                  255,
+                  0,
+                  169
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "lp_mint"
+              }
+            ],
+            "program": {
+              "kind": "const",
+              "value": [
+                140,
+                151,
+                37,
+                143,
+                78,
+                36,
+                137,
+                241,
+                187,
+                61,
+                16,
+                41,
+                20,
+                142,
+                13,
+                131,
+                11,
+                90,
+                19,
+                153,
+                218,
+                255,
+                16,
+                132,
+                4,
+                142,
+                123,
+                216,
+                219,
+                233,
+                248,
+                89
+              ]
+            }
+          }
+        },
+        {
+          "name": "token_program",
+          "address": "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"
+        },
+        {
+          "name": "associated_token_program",
+          "address": "ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL"
+        },
+        {
+          "name": "system_program",
+          "address": "11111111111111111111111111111111"
+        }
+      ],
+      "args": []
+    },
+    {
       "name": "update_config",
       "discriminator": [
         29,
@@ -2754,6 +2927,19 @@
       ]
     },
     {
+      "name": "LP_UNLOCKED",
+      "discriminator": [
+        83,
+        10,
+        33,
+        140,
+        182,
+        48,
+        201,
+        137
+      ]
+    },
+    {
       "name": "TRADE",
       "discriminator": [
         230,
@@ -2777,19 +2963,6 @@
         196,
         23,
         17
-      ]
-    },
-    {
-      "name": "LP_UNLOCKED",
-      "discriminator": [
-        83,
-        10,
-        33,
-        140,
-        182,
-        48,
-        201,
-        137
       ]
     }
   ],
@@ -2883,6 +3056,11 @@
       "code": 6017,
       "name": "NoLpToUnlock",
       "msg": "No LP tokens to unlock"
+    },
+    {
+      "code": 6018,
+      "name": "SlippageExceeded",
+      "msg": "Slippage tolerance exceeded"
     }
   ],
   "types": [
@@ -3018,18 +3196,30 @@
           },
           {
             "name": "liquidity_lock_secs",
+            "docs": [
+              "Lock duration in seconds (minimum 30 days), set at token creation"
+            ],
             "type": "u64"
           },
           {
             "name": "liquidity_unlock_ts",
+            "docs": [
+              "Unix timestamp when LP may be moved to migrator (set on migrate)"
+            ],
             "type": "i64"
           },
           {
             "name": "pool_lp_mint",
+            "docs": [
+              "Raydium pool LP mint (set on migrate)"
+            ],
             "type": "pubkey"
           },
           {
             "name": "lp_unlocked",
+            "docs": [
+              "True after successful unlock_lp"
+            ],
             "type": "bool"
           }
         ]
@@ -3134,6 +3324,9 @@
           },
           {
             "name": "liquidity_lock_secs",
+            "docs": [
+              "LP lock duration in seconds (minimum 30 days)"
+            ],
             "type": "u64"
           }
         ]
@@ -3154,6 +3347,10 @@
           },
           {
             "name": "creator_fee_bps",
+            "type": "u32"
+          },
+          {
+            "name": "reward_fee_bps",
             "type": "u32"
           },
           {
@@ -3193,6 +3390,10 @@
             "type": "u32"
           },
           {
+            "name": "reward_fee_bps",
+            "type": "u32"
+          },
+          {
             "name": "creator_migrate_fee_bps",
             "type": "u32"
           },
@@ -3202,6 +3403,26 @@
           },
           {
             "name": "real_sol_threshold",
+            "type": "u64"
+          }
+        ]
+      }
+    },
+    {
+      "name": "LP_UNLOCKED",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "mint",
+            "type": "pubkey"
+          },
+          {
+            "name": "migrator",
+            "type": "pubkey"
+          },
+          {
+            "name": "amount",
             "type": "u64"
           }
         ]
@@ -3271,6 +3492,10 @@
           {
             "name": "creator_fee",
             "type": "u64"
+          },
+          {
+            "name": "reward_fee",
+            "type": "u64"
           }
         ]
       }
@@ -3301,6 +3526,10 @@
             "type": "u64"
           },
           {
+            "name": "reward_fee",
+            "type": "u64"
+          },
+          {
             "name": "fee_amount",
             "type": "u64"
           }
@@ -3322,6 +3551,10 @@
           },
           {
             "name": "creator_fee_bps",
+            "type": "u32"
+          },
+          {
+            "name": "reward_fee_bps",
             "type": "u32"
           },
           {

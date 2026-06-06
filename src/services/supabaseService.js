@@ -730,6 +730,7 @@ class SupabaseService {
             trade_type: !!feeData.tradeType,
             platform_fee: String(feeData.platformFee ?? '0'),
             creator_fee: String(feeData.creatorFee ?? '0'),
+            reward_fee: String(feeData.rewardFee ?? '0'),
             fee_amount: String(feeData.feeAmount ?? '0'),
             transaction_hash: txHash,
             slot: feeData.slot ?? null,
@@ -927,6 +928,70 @@ class SupabaseService {
     }
 
     /**
+     * Compute eligible reward aggregates for one distribution round with wash-trade filtering.
+     *
+     * Eligibility rule: for each (wallet_address, mint) pair, a trade is eligible only if
+     * the previous trade by the same wallet on the same mint was at least `cooldownSeconds` ago.
+     * This prevents rapid buy/sell cycling of the same token from gaming the rewards pool.
+     *
+     * Returns per-wallet sums of eligible reward_fee and the grand total.
+     *
+     * @param {string} chain
+     * @param {number} cooldownSeconds - Min seconds between eligible trades for same wallet+mint
+     * @param {string} beforeIso - Only consider rows with created_at < this timestamp
+     * @returns {Promise<{ totalRewardLamports: string, byWallet: Array<{ walletAddress: string, rewardLamports: string }> }>}
+     */
+    async getEligibleRewardAggregates(chain, cooldownSeconds = 300, beforeIso = null) {
+        // Fetch all relevant rows ordered by (wallet, mint, created_at)
+        let query = supabase
+            .from('trader_fees')
+            .select('wallet_address, mint, reward_fee, created_at')
+            .eq('chain', chain)
+            .order('wallet_address', { ascending: true })
+            .order('mint', { ascending: true })
+            .order('created_at', { ascending: true });
+
+        if (beforeIso) {
+            query = query.lt('created_at', beforeIso);
+        }
+
+        const { data: rows, error } = await query;
+        if (error) throw error;
+
+        const cooldownMs = cooldownSeconds * 1000;
+        const byWallet = new Map();
+        let total = 0n;
+
+        // Track last eligible timestamp per (wallet, mint)
+        const lastEligible = new Map();
+
+        for (const r of rows || []) {
+            const rewardFee = BigInt(String(r.reward_fee || '0'));
+            if (rewardFee <= 0n) continue;
+
+            const key = `${r.wallet_address}::${r.mint}`;
+            const tradeTime = new Date(r.created_at).getTime();
+            const prev = lastEligible.get(key);
+
+            // Eligible if: first trade for this (wallet, mint) pair,
+            // or at least cooldownSeconds since last eligible trade
+            if (prev === undefined || (tradeTime - prev) >= cooldownMs) {
+                lastEligible.set(key, tradeTime);
+                total += rewardFee;
+                const w = String(r.wallet_address || '').trim();
+                if (w) byWallet.set(w, (byWallet.get(w) || 0n) + rewardFee);
+            }
+        }
+
+        const byWalletList = Array.from(byWallet.entries()).map(([walletAddress, rewardLamports]) => ({
+            walletAddress,
+            rewardLamports: String(rewardLamports)
+        }));
+
+        return { totalRewardLamports: String(total), byWallet: byWalletList };
+    }
+
+    /**
      * Delete trader_fees rows where created_at < cutoff (after distribution).
      * @param {string} cutoffIso - ISO timestamp; rows with created_at < this are deleted
      * @param {string} chain - 'solana' | 'evm' (optional, if not provided deletes all chains)
@@ -1082,18 +1147,20 @@ class SupabaseService {
                 cycle: data.cycle,
                 rewardRatio: Number(data.reward_ratio),
                 nextDistributionAt: data.next_distribution_at,
-                minimumRewardLamports: String(data.minimum_reward_lamports || '1000')
+                minimumRewardLamports: String(data.minimum_reward_lamports || '1000'),
+                washTradeCooldownSeconds: Number(data.wash_trade_cooldown_seconds ?? 300)
             };
         }
         const now = new Date();
-        const nextAt = new Date(now.getTime() + 5 * 60 * 1000); // 5 min round default
+        const nextAt = new Date(now.getTime() + 5 * 60 * 1000);
         const { data: inserted, error: insertErr } = await supabase
             .from('reward_distribution_config')
             .insert({
                 cycle: '5min',
                 reward_ratio: 0.5,
                 next_distribution_at: nextAt.toISOString(),
-                minimum_reward_lamports: 1000
+                minimum_reward_lamports: 1000,
+                wash_trade_cooldown_seconds: 300
             })
             .select()
             .single();
@@ -1102,7 +1169,8 @@ class SupabaseService {
             cycle: inserted.cycle,
             rewardRatio: Number(inserted.reward_ratio),
             nextDistributionAt: inserted.next_distribution_at,
-            minimumRewardLamports: String(inserted.minimum_reward_lamports || '1000')
+            minimumRewardLamports: String(inserted.minimum_reward_lamports || '1000'),
+            washTradeCooldownSeconds: Number(inserted.wash_trade_cooldown_seconds ?? 300)
         };
     }
 
@@ -1122,6 +1190,7 @@ class SupabaseService {
         if (updates.rewardRatio != null) payload.reward_ratio = updates.rewardRatio;
         if (updates.nextDistributionAt != null) payload.next_distribution_at = updates.nextDistributionAt;
         if (updates.minimumRewardLamports != null) payload.minimum_reward_lamports = updates.minimumRewardLamports;
+        if (updates.washTradeCooldownSeconds != null) payload.wash_trade_cooldown_seconds = updates.washTradeCooldownSeconds;
         payload.updated_at = new Date().toISOString();
         if (existing?.id) {
             const { error } = await supabase
@@ -1192,6 +1261,7 @@ class SupabaseService {
             tradeType: data.trade_type,
             platformFee: data.platform_fee,
             creatorFee: data.creator_fee,
+            rewardFee: data.reward_fee ?? '0',
             feeAmount: data.fee_amount,
             transactionHash: data.transaction_hash,
             slot: data.slot,

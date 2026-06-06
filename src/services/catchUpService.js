@@ -177,7 +177,7 @@ class CatchUpService {
      */
     async processTraderFeeEvent(contractAddress, event) {
         const toAddr = (v) => (v && typeof v === 'string' ? v : (v && typeof v.toString === 'function' ? v.toString() : String(v || ''))).toLowerCase();
-        const [trader, tokenAddress, tradeType, platformFee, creatorFee, feeAmount] = event.args;
+        const [trader, tokenAddress, tradeType, platformFee, creatorFee, rewardFee, feeAmount] = event.args;
         const tokenAddressLower = toAddr(tokenAddress);
         const traderLower = toAddr(trader);
         const eventBlockNumber = event.blockNumber && event.blockNumber.toNumber ? event.blockNumber.toNumber() : Number(event.blockNumber);
@@ -193,6 +193,7 @@ class CatchUpService {
             tradeType: tradeType,
             platformFee: platformFee.toString(),
             creatorFee: creatorFee.toString(),
+            rewardFee: rewardFee ? rewardFee.toString() : '0',
             feeAmount: feeAmount.toString(),
             transactionHash: (typeof event.transactionHash === 'string' ? event.transactionHash : event.transactionHash).toLowerCase(),
             slot: eventBlockNumber,

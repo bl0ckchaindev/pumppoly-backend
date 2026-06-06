@@ -1017,25 +1017,26 @@ class SolanaEventListener {
                 return;
             }
 
-            const tradeType = eventData.trade_type !== undefined ? eventData.trade_type : (eventData.tradeType !== undefined ? eventData.tradeType : false);
+            const tradeType  = eventData.trade_type  !== undefined ? eventData.trade_type  : (eventData.tradeType  !== undefined ? eventData.tradeType  : false);
             const platformFee = safeBigInt(eventData.platform_fee ?? eventData.platformFee ?? 0);
-            const creatorFee = safeBigInt(eventData.creator_fee ?? eventData.creatorFee ?? 0);
-            const feeAmount = safeBigInt(eventData.fee_amount ?? eventData.feeAmount ?? 0);
+            const creatorFee  = safeBigInt(eventData.creator_fee  ?? eventData.creatorFee  ?? 0);
+            const rewardFee   = safeBigInt(eventData.reward_fee   ?? eventData.rewardFee   ?? 0);
+            const feeAmount   = safeBigInt(eventData.fee_amount   ?? eventData.feeAmount   ?? 0);
 
             const blockTime = transaction.blockTime || Math.floor(Date.now() / 1000);
             const slot = transaction.slot || 0;
 
-            console.log('[god-log] handleTraderFeeEvent', 
+            console.log('[god-log] handleTraderFeeEvent',
                 `user: ${user}`,
                 `mint: ${mint}`,
                 `tradeType: ${tradeType}`,
                 `platformFee: ${platformFee}`,
                 `creatorFee: ${creatorFee}`,
+                `rewardFee: ${rewardFee}`,
                 `feeAmount: ${feeAmount}`,
                 `blockTime: ${blockTime}`,
                 `slot: ${slot}`,
                 `signature: ${signature}`,
-                `transaction: ${transaction}`,
             );
 
             try {
@@ -1045,6 +1046,7 @@ class SolanaEventListener {
                     tradeType,
                     platformFee,
                     creatorFee,
+                    rewardFee,
                     feeAmount,
                     transactionHash: signature,
                     slot,

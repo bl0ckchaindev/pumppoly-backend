@@ -7,6 +7,7 @@ const solanaService = require('../services/solanaService');
  * Body: {
  *   protocolFeeBps: number,
  *   creatorFeeBps: number,
+ *   rewardFeeBps: number,
  *   creatorMigrateFeeBps: number,
  *   protocolMigrateFeeBps: number,
  *   realSolThreshold: string | number  // lamports (e.g. 65000000000 for 65 SOL)
@@ -18,6 +19,7 @@ router.post('/update-global-config', async (req, res) => {
         const body = req.body || {};
         const protocolFeeBps = body.protocolFeeBps;
         const creatorFeeBps = body.creatorFeeBps;
+        const rewardFeeBps = body.rewardFeeBps;
         const creatorMigrateFeeBps = body.creatorMigrateFeeBps;
         const protocolMigrateFeeBps = body.protocolMigrateFeeBps;
         const realSolThreshold = body.realSolThreshold;
@@ -27,6 +29,9 @@ router.post('/update-global-config', async (req, res) => {
         }
         if (creatorFeeBps === undefined || creatorFeeBps === null) {
             return res.status(400).json({ error: 'creatorFeeBps is required' });
+        }
+        if (rewardFeeBps === undefined || rewardFeeBps === null) {
+            return res.status(400).json({ error: 'rewardFeeBps is required' });
         }
         if (creatorMigrateFeeBps === undefined || creatorMigrateFeeBps === null) {
             return res.status(400).json({ error: 'creatorMigrateFeeBps is required' });
@@ -40,6 +45,7 @@ router.post('/update-global-config', async (req, res) => {
 
         const protocolFeeBpsNum = Number(protocolFeeBps);
         const creatorFeeBpsNum = Number(creatorFeeBps);
+        const rewardFeeBpsNum = Number(rewardFeeBps);
         const creatorMigrateFeeBpsNum = Number(creatorMigrateFeeBps);
         const protocolMigrateFeeBpsNum = Number(protocolMigrateFeeBps);
         if (!Number.isInteger(protocolFeeBpsNum) || protocolFeeBpsNum < 0 || protocolFeeBpsNum > 10000) {
@@ -47,6 +53,9 @@ router.post('/update-global-config', async (req, res) => {
         }
         if (!Number.isInteger(creatorFeeBpsNum) || creatorFeeBpsNum < 0 || creatorFeeBpsNum > 10000) {
             return res.status(400).json({ error: 'creatorFeeBps must be an integer 0-10000' });
+        }
+        if (!Number.isInteger(rewardFeeBpsNum) || rewardFeeBpsNum < 0 || rewardFeeBpsNum > 10000) {
+            return res.status(400).json({ error: 'rewardFeeBps must be an integer 0-10000' });
         }
         if (!Number.isInteger(creatorMigrateFeeBpsNum) || creatorMigrateFeeBpsNum < 0 || creatorMigrateFeeBpsNum > 10000) {
             return res.status(400).json({ error: 'creatorMigrateFeeBps must be an integer 0-10000' });
@@ -62,6 +71,7 @@ router.post('/update-global-config', async (req, res) => {
         const signature = await solanaService.updateGlobalConfig({
             protocolFeeBps: protocolFeeBpsNum,
             creatorFeeBps: creatorFeeBpsNum,
+            rewardFeeBps: rewardFeeBpsNum,
             creatorMigrateFeeBps: creatorMigrateFeeBpsNum,
             protocolMigrateFeeBps: protocolMigrateFeeBpsNum,
             realSolThreshold: realSolThresholdVal
@@ -73,6 +83,7 @@ router.post('/update-global-config', async (req, res) => {
             config: {
                 protocolFeeBps: protocolFeeBpsNum,
                 creatorFeeBps: creatorFeeBpsNum,
+                rewardFeeBps: rewardFeeBpsNum,
                 creatorMigrateFeeBps: creatorMigrateFeeBpsNum,
                 protocolMigrateFeeBps: protocolMigrateFeeBpsNum,
                 realSolThreshold: realSolThresholdVal

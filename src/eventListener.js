@@ -527,6 +527,7 @@ class EventListener {
                     tradeType,
                     platformFee,
                     creatorFee,
+                    rewardFee,
                     feeAmount,
                     event
                 ) => {
@@ -537,9 +538,10 @@ class EventListener {
                         console.log(`  Type: ${tradeType ? 'BUY' : 'SELL'}`);
                         console.log(`  Platform Fee: ${platformFee.toString()}`);
                         console.log(`  Creator Fee: ${creatorFee.toString()}`);
+                        console.log(`  Reward Fee: ${rewardFee.toString()}`);
                         console.log(`  Total Fee: ${feeAmount.toString()}`);
                         console.log(`  TX: ${event.transactionHash}`);
-                        
+
                         await this.handleTraderFeeEvent(
                             normalizedAddress,
                             trader,
@@ -547,6 +549,7 @@ class EventListener {
                             tradeType,
                             platformFee,
                             creatorFee,
+                            rewardFee,
                             feeAmount,
                             event
                         );
@@ -657,7 +660,7 @@ class EventListener {
 
     /**
      * Handle TraderFee event from bonding curve (for reward distribution tracking)
-     * Event parameters: trader, tokenAddress, tradeType, platformFee, creatorFee, feeAmount
+     * Event parameters: trader, tokenAddress, tradeType, platformFee, creatorFee, rewardFee, feeAmount
      */
     async handleTraderFeeEvent(
         bondingCurveAddress,
@@ -666,6 +669,7 @@ class EventListener {
         tradeType,
         platformFee,
         creatorFee,
+        rewardFee,
         feeAmount,
         event
     ) {
@@ -674,7 +678,7 @@ class EventListener {
             const tokenAddressLower = toAddr(tokenAddress);
             const traderLower = toAddr(trader);
             const eventBlockNumber = event.blockNumber && event.blockNumber.toNumber ? event.blockNumber.toNumber() : Number(event.blockNumber);
-            
+
             // Get block timestamp
             let blockTime = Math.floor(Date.now() / 1000);
             try {
@@ -695,6 +699,7 @@ class EventListener {
                     tradeType: tradeType,
                     platformFee: platformFee.toString(),
                     creatorFee: creatorFee.toString(),
+                    rewardFee: rewardFee ? rewardFee.toString() : '0',
                     feeAmount: feeAmount.toString(),
                     transactionHash: event.transactionHash.toLowerCase(),
                     slot: eventBlockNumber,
@@ -1119,7 +1124,7 @@ class EventListener {
                 for (const event of traderFeeEvents) {
                     const txHash = typeof event.transactionHash === 'string' ? event.transactionHash.toLowerCase() : event.transactionHash;
                     if (await supabaseService.checkTraderFeeExists(txHash, getEvmChainSlug())) continue;
-                    const [trader, tokenAddress, tradeType, platformFee, creatorFee, feeAmount] = event.args;
+                    const [trader, tokenAddress, tradeType, platformFee, creatorFee, rewardFee, feeAmount] = event.args;
                     await this.handleTraderFeeEvent(
                         bondingCurveAddress,
                         trader,
@@ -1127,6 +1132,7 @@ class EventListener {
                         tradeType,
                         platformFee,
                         creatorFee,
+                        rewardFee,
                         feeAmount,
                         event
                     );
@@ -1345,7 +1351,7 @@ class EventListener {
                                     if (ebSkip > maxProcessedBlock) maxProcessedBlock = ebSkip;
                                     continue;
                                 }
-                                const [trader, tokenAddress, tradeType, platformFee, creatorFee, feeAmount] = event.args;
+                                const [trader, tokenAddress, tradeType, platformFee, creatorFee, rewardFee, feeAmount] = event.args;
                                 await this.handleTraderFeeEvent(
                                     address,
                                     trader,
@@ -1353,6 +1359,7 @@ class EventListener {
                                     tradeType,
                                     platformFee,
                                     creatorFee,
+                                    rewardFee,
                                     feeAmount,
                                     event
                                 );
@@ -1573,7 +1580,7 @@ class EventListener {
                         if (traderFeeTopic && log.topics && log.topics[0] !== traderFeeTopic) continue;
                         const txHash = (receipt.transactionHash || '').toLowerCase();
                         if (await supabaseService.checkTraderFeeExists(txHash, getEvmChainSlug())) continue;
-                        const [trader, tokenAddress, tradeType, platformFee, creatorFee, feeAmount] = parsedLog.args;
+                        const [trader, tokenAddress, tradeType, platformFee, creatorFee, rewardFee, feeAmount] = parsedLog.args;
                         const eventObj = {
                             transactionHash: receipt.transactionHash,
                             blockNumber: receipt.blockNumber,
@@ -1586,6 +1593,7 @@ class EventListener {
                             tradeType,
                             platformFee,
                             creatorFee,
+                            rewardFee,
                             feeAmount,
                             eventObj
                         );

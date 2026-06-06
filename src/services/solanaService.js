@@ -503,11 +503,70 @@ class SolanaService {
     }
 
     /**
+     * Initialize the global config on the Solana program (one-time, owner-only).
+     * The treasury wallet (SOLANA_TREASURY_PRIVATE_KEY) becomes the config owner + migrator.
+     * Fails if the config is already initialized.
+     * @param {Object} params
+     * @param {number} params.protocolFeeBps - Protocol fee in basis points
+     * @param {number} params.creatorFeeBps - Creator fee in basis points
+     * @param {number} params.rewardFeeBps - Reward (trader) fee in basis points
+     * @param {number} params.creatorMigrateFeeBps - Creator migration fee in basis points
+     * @param {number} params.protocolMigrateFeeBps - Protocol migration fee in basis points
+     * @param {string|number|bigint} params.realSolThreshold - Graduation threshold in lamports (u64)
+     * @returns {Promise<string>} Transaction signature
+     */
+    async initializeConfig(params) {
+        await this.initialize();
+        if (!this.treasuryKeypair) {
+            throw new Error('SOLANA_TREASURY_PRIVATE_KEY is not set; cannot initialize global config');
+        }
+        const owner = this.treasuryKeypair.publicKey;
+        const globalConfig = this.getGlobalConfigPDA();
+        const feeAuthority = this.getFeeAuthorityPDA();
+        // ATA owned by the fee_authority PDA (allowOwnerOffCurve = true)
+        const feeWsolAccount = getAssociatedTokenAddressSync(NATIVE_MINT, feeAuthority, true);
+        const realSolThreshold = new BN(String(params.realSolThreshold ?? '0'));
+        if (realSolThreshold.lt(new BN(0))) {
+            throw new Error('realSolThreshold must be non-negative (lamports)');
+        }
+        const args = {
+            protocolFeeBps: Number(params.protocolFeeBps ?? 0),
+            creatorFeeBps: Number(params.creatorFeeBps ?? 0),
+            rewardFeeBps: Number(params.rewardFeeBps ?? 0),
+            creatorMigrateFeeBps: Number(params.creatorMigrateFeeBps ?? 0),
+            protocolMigrateFeeBps: Number(params.protocolMigrateFeeBps ?? 0),
+            realSolThreshold
+        };
+        const tx = await this.program.methods
+            .initializeConfig(args)
+            .accountsPartial({
+                owner,
+                globalConfig,
+                nativeMint: NATIVE_MINT,
+                feeAuthority,
+                feeWsolAccount,
+                tokenProgram: TOKEN_PROGRAM_ID,
+                associatedTokenProgram: ASSOCIATED_TOKEN_PROGRAM_ID,
+                systemProgram: SystemProgram.programId
+            })
+            .signers([this.treasuryKeypair])
+            .transaction();
+        const sig = await sendAndConfirmTransaction(
+            this.connection,
+            tx,
+            [this.treasuryKeypair],
+            { commitment: 'confirmed', skipPreflight: false }
+        );
+        return sig;
+    }
+
+    /**
      * Update global config on the Solana program (owner-only).
      * Requires SOLANA_TREASURY_PRIVATE_KEY (contract owner).
      * @param {Object} params
      * @param {number} params.protocolFeeBps - Protocol fee in basis points
      * @param {number} params.creatorFeeBps - Creator fee in basis points
+     * @param {number} params.rewardFeeBps - Reward (trader) fee in basis points
      * @param {number} params.creatorMigrateFeeBps - Creator migration fee in basis points
      * @param {number} params.protocolMigrateFeeBps - Protocol migration fee in basis points
      * @param {string|number|bigint} params.realSolThreshold - Real SOL threshold in lamports (u64)
@@ -528,6 +587,7 @@ class SolanaService {
             owner,
             protocolFeeBps: Number(params.protocolFeeBps ?? 0),
             creatorFeeBps: Number(params.creatorFeeBps ?? 0),
+            rewardFeeBps: Number(params.rewardFeeBps ?? 0),
             creatorMigrateFeeBps: Number(params.creatorMigrateFeeBps ?? 0),
             protocolMigrateFeeBps: Number(params.protocolMigrateFeeBps ?? 0),
             migrator: owner,
