@@ -100,10 +100,32 @@ const app = express();
 // Security headers
 app.use(securityHeaders);
 
-// CORS configuration - allow all origins
+// CORS configuration
+// Allowed origins come from defaults + the CORS_ORIGINS env var (comma-separated). In
+// development (NODE_ENV !== 'production') any localhost / 127.0.0.1 origin is allowed on any
+// port, so the frontend dev server (e.g. :3000, :5173, :8080) works without config changes.
+const DEFAULT_ALLOWED_ORIGINS = [
+    'https://trollspump.com',
+    'http://localhost:3000',
+    'http://localhost:8080'
+];
+const ENV_ALLOWED_ORIGINS = (process.env.CORS_ORIGINS || '')
+    .split(',')
+    .map(o => o.trim())
+    .filter(Boolean);
+const ALLOWED_ORIGINS = new Set([...DEFAULT_ALLOWED_ORIGINS, ...ENV_ALLOWED_ORIGINS]);
+const IS_PRODUCTION = process.env.NODE_ENV === 'production';
+const LOCALHOST_ORIGIN = /^https?:\/\/(localhost|127\.0\.0\.1)(:\d+)?$/;
+
 app.use(cors({
-    origin: ['https://trollspump.com', 'http://localhost:3000'], // Allow all origins (returns the origin in Access-Control-Allow-Origin)
-    credentials: true, // Allow credentials
+    origin(origin, callback) {
+        // No Origin header: same-origin, curl, or server-to-server — allow.
+        if (!origin) return callback(null, true);
+        if (ALLOWED_ORIGINS.has(origin)) return callback(null, true);
+        if (!IS_PRODUCTION && LOCALHOST_ORIGIN.test(origin)) return callback(null, true);
+        return callback(new Error(`Not allowed by CORS: ${origin}`));
+    },
+    credentials: true, // reflects the specific origin (never '*') so credentialed requests work
     methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
     allowedHeaders: ['Content-Type', 'Authorization', 'X-Requested-With']
 }));

@@ -5,7 +5,27 @@
  */
 const express = require('express');
 const router = express.Router();
+const nacl = require('tweetnacl');
+const { PublicKey } = require('@solana/web3.js');
 const tokenService = require('../services/tokenService');
+const supabaseService = require('../services/supabaseService');
+
+// Canonical message a creator signs to authorize a token media update. MUST match the frontend
+// `tokenMediaMessage` byte-for-byte.
+function tokenMediaMessage(chain, token, logo, banner) {
+  return `PumpPoly set token media\nchain: ${chain}\ntoken: ${token}\nlogo: ${logo}\nbanner: ${banner}`;
+}
+
+function verifySolanaSignature(message, signatureB64, publicKeyB58) {
+  try {
+    const msg = new Uint8Array(Buffer.from(message, 'utf8'));
+    const sig = new Uint8Array(Buffer.from(signatureB64, 'base64'));
+    const pub = new PublicKey(publicKeyB58).toBytes();
+    return sig.length === 64 && nacl.sign.detached.verify(msg, sig, pub);
+  } catch (_) {
+    return false;
+  }
+}
 const { getEventListener } = require('../eventListener');
 const { virtualEthLpInitial, virtualTokenLpInitial, realEthLpInitial, realTokenLpInitial, bondingLimit } = require('../config');
 const { chainIdToSlug, CHAIN_ID_TO_SLUG } = require('../lib/chainUtils');
@@ -79,7 +99,17 @@ router.post('/tokens/register', async (req, res) => {
     const realEthLp = realEthLpInitial || '0';
     const realTokenLp = realTokenLpInitial || '200000000000000000000000000';
     const k = (BigInt(virtualEthLp) * BigInt(virtualTokenLp)).toString();
-    const blockNum = blockNumber != null ? Number(blockNumber) : 0;
+    let blockNum = blockNumber != null ? Number(blockNumber) : 0;
+    // Frontend registrations usually omit the block number. Backfill it from the tx receipt so
+    // downstream block-range scans (holder indexer, catch-up) don't start from genesis.
+    if (!blockNum && transactionHash) {
+      try {
+        const listener = getEventListener();
+        if (!listener.provider) await listener.initialize();
+        const receipt = await listener.provider.getTransactionReceipt(transactionHash);
+        if (receipt && receipt.blockNumber) blockNum = Number(receipt.blockNumber);
+      } catch (e) { /* keep 0; holder indexer floors at FACTORY_DEPLOY_BLOCK */ }
+    }
     const ts = timestamp != null ? Number(timestamp) : Math.floor(Date.now() / 1000);
 
     const chainSlug =
@@ -133,6 +163,60 @@ router.post('/tokens/register', async (req, res) => {
       success: false,
       error: err.message || 'Failed to register token'
     });
+  }
+});
+
+/**
+ * POST /tokens/media
+ * Set a token's logo/banner after creation, for chains where media isn't carried on-chain
+ * (Solana banner). Locked down: the caller must sign `tokenMediaMessage(...)` with the wallet that
+ * is the token's on-chain creator. The signature binds the exact logo/banner values.
+ * Body: { chain, tokenAddress, logoUrl, bannerUrl, publicKey, signature }
+ * Returns { success, found } — `found:false` means the token row isn't indexed yet (caller retries).
+ */
+router.post('/tokens/media', async (req, res) => {
+  try {
+    const { chain, tokenAddress, logoUrl = '', bannerUrl = '', publicKey, signature } = req.body || {};
+    if (!chain || !tokenAddress) {
+      return res.status(400).json({ success: false, error: 'chain and tokenAddress are required' });
+    }
+    // Only Solana uses this endpoint (EVM media is set at registration time). ed25519 verification.
+    if (chain !== 'solana') {
+      return res.status(400).json({ success: false, error: 'Unsupported chain for media update' });
+    }
+    if (!publicKey || !signature) {
+      return res.status(401).json({ success: false, error: 'Missing signature' });
+    }
+
+    const existing = await supabaseService.getTokenByAddress(tokenAddress, chain);
+    if (!existing) {
+      return res.status(200).json({ success: false, found: false });
+    }
+
+    // Write-once: media is immutable once stored. If the banner is already set, refuse to change it.
+    // (Returned as 200 so the client's retry loop stops instead of treating it as a transient error.)
+    const hasValue = (v) => typeof v === 'string' && v.trim() !== '';
+    if (hasValue(existing.bannerUrl)) {
+      return res.status(200).json({ success: false, found: true, locked: true, error: 'Token media already set' });
+    }
+
+    // Verify the signature is over the exact media values, by the token's creator.
+    const message = tokenMediaMessage(chain, String(tokenAddress), String(logoUrl), String(bannerUrl));
+    if (!verifySolanaSignature(message, signature, publicKey)) {
+      return res.status(401).json({ success: false, error: 'Invalid signature' });
+    }
+    if (String(publicKey) !== String(existing.creator)) {
+      return res.status(403).json({ success: false, error: 'Signer is not the token creator' });
+    }
+
+    // Only fill fields that aren't set yet (Solana logo is set on-chain at creation).
+    const update = { bannerUrl: String(bannerUrl) };
+    if (!hasValue(existing.logoUrl)) update.logoUrl = String(logoUrl);
+    const token = await supabaseService.updateToken(tokenAddress, update, chain);
+    return res.status(200).json({ success: true, found: true, token });
+  } catch (err) {
+    console.error('POST /tokens/media error:', err);
+    return res.status(500).json({ success: false, error: err.message || 'Failed to set token media' });
   }
 });
 

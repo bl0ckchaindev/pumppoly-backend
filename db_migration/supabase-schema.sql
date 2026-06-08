@@ -7,6 +7,7 @@
 --   • supabase-migration-liquidity-lock.sql   (LP lock columns on bonding_curves)
 --   • supabase-migration-rewards.sql          (trader_fees.reward_fee + cooldown)
 --   • supabase-migration-drop-chain-check.sql (no chain CHECK constraints here)
+--   • supabase-migration-token-holders.sql    (token_holders on-chain balance index)
 --
 -- EXISTING projects: do NOT run this (it assumes empty tables). Apply the
 -- individual migration files in date order instead.
@@ -156,6 +157,7 @@ CREATE TABLE IF NOT EXISTS profiles (
     username TEXT,
     bio TEXT DEFAULT '',
     avatar_url TEXT DEFAULT '',
+    banner_url TEXT DEFAULT '',
     twitter TEXT DEFAULT '',
     telegram TEXT DEFAULT '',
     website TEXT DEFAULT '',
@@ -256,6 +258,25 @@ CREATE TABLE IF NOT EXISTS reward_distribution_runs (
 CREATE INDEX IF NOT EXISTS idx_reward_runs_distribution_at ON reward_distribution_runs(distribution_at DESC);
 
 -- ============================================
+-- TOKEN HOLDERS (on-chain balance index; EVM + Solana)
+-- Populated by the backend holder indexer (src/services/holderService.js): EVM via ERC20
+-- balanceOf over Transfer-log discovery, Solana via SPL token accounts of the mint. `balance`
+-- is raw base units. Bonding curve / pool / zero / dead addresses are excluded by the indexer.
+-- ============================================
+CREATE TABLE IF NOT EXISTS token_holders (
+    id UUID DEFAULT uuid_generate_v4() PRIMARY KEY,
+    chain TEXT NOT NULL,
+    token_address TEXT NOT NULL,
+    wallet_address TEXT NOT NULL,
+    balance TEXT NOT NULL DEFAULT '0',   -- raw base units (string for full precision)
+    updated_at TIMESTAMPTZ DEFAULT NOW(),
+    UNIQUE (chain, token_address, wallet_address)
+);
+
+CREATE INDEX IF NOT EXISTS idx_token_holders_token ON token_holders(chain, token_address);
+CREATE INDEX IF NOT EXISTS idx_token_holders_wallet ON token_holders(wallet_address);
+
+-- ============================================
 -- ENABLE REALTIME FOR TABLES
 -- ============================================
 ALTER PUBLICATION supabase_realtime ADD TABLE tokens;
@@ -264,6 +285,7 @@ ALTER PUBLICATION supabase_realtime ADD TABLE chat_messages;
 ALTER PUBLICATION supabase_realtime ADD TABLE token_price_data;
 ALTER PUBLICATION supabase_realtime ADD TABLE trade_history;
 ALTER PUBLICATION supabase_realtime ADD TABLE profiles;
+ALTER PUBLICATION supabase_realtime ADD TABLE token_holders;
 
 -- ============================================
 -- ROW LEVEL SECURITY (RLS)
@@ -277,6 +299,7 @@ ALTER TABLE trade_history ENABLE ROW LEVEL SECURITY;
 ALTER TABLE trader_fees ENABLE ROW LEVEL SECURITY;
 ALTER TABLE reward_distribution_config ENABLE ROW LEVEL SECURITY;
 ALTER TABLE reward_distribution_runs ENABLE ROW LEVEL SECURITY;
+ALTER TABLE token_holders ENABLE ROW LEVEL SECURITY;
 
 -- Public read access (frontend reads directly with the anon key)
 CREATE POLICY "Allow public read access" ON tokens FOR SELECT USING (true);
@@ -285,6 +308,7 @@ CREATE POLICY "Allow public read access" ON chat_messages FOR SELECT USING (true
 CREATE POLICY "Allow public read access" ON token_price_data FOR SELECT USING (true);
 CREATE POLICY "Allow public read access" ON profiles FOR SELECT USING (true);
 CREATE POLICY "Allow public read access" ON trade_history FOR SELECT USING (true);
+CREATE POLICY "Allow public read access" ON token_holders FOR SELECT USING (true);
 
 -- Trader fees & reward tables: backend (service role) only — no public policies.
 
@@ -310,6 +334,7 @@ CREATE POLICY "Allow service role full access" ON trade_history FOR ALL USING (a
 CREATE POLICY "Allow service role full access" ON trader_fees FOR ALL USING (auth.role() = 'service_role');
 CREATE POLICY "Allow service role full access" ON reward_distribution_config FOR ALL USING (auth.role() = 'service_role');
 CREATE POLICY "Allow service role full access" ON reward_distribution_runs FOR ALL USING (auth.role() = 'service_role');
+CREATE POLICY "Allow service role full access" ON token_holders FOR ALL USING (auth.role() = 'service_role');
 
 -- ============================================
 -- updated_at TRIGGER

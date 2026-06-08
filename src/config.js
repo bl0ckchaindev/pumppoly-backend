@@ -18,6 +18,9 @@ module.exports = {
     oracleRpcUrl: process.env.ORACLE_RPC_URL,
     privateKey: process.env.PRIVATE_KEY,
     contractAddr: process.env.CONTRACT_ADDRESS,
+    // Block the Factory contract was deployed at. Factory catch-up never scans before this,
+    // so a fresh/empty database doesn't trigger a scan from block 1 across the whole chain.
+    factoryDeployBlock: Number(process.env.FACTORY_DEPLOY_BLOCK) || 0,
     // Solana: RPC and treasury (contract owner) key for reward distribution
     solanaRpcUrl: process.env.SOLANA_RPC_URL,
     solanaTreasuryPrivateKey: process.env.SOLANA_TREASURY_PRIVATE_KEY, // JSON array format e.g. [1,2,...]

@@ -45,9 +45,14 @@ class TokenService {
             let bondingCurve = await supabaseService.getBondingCurveByAddress(bondingCurveAddress, chain);
 
             if (token && bondingCurve) {
-                // If logo/banner provided (e.g. from frontend register after upload), update token metadata
-                if ((logoUrl || bannerUrl) && (String(logoUrl || '').trim() || String(bannerUrl || '').trim())) {
-                    token = await supabaseService.updateToken(tokenAddress, { logoUrl: logoUrl || token.logoUrl, bannerUrl: bannerUrl || token.bannerUrl }, chain);
+                // Write-once: only fill media fields that aren't set yet. Once stored, logo/banner
+                // are immutable (prevents later overwrites / defacement of an existing token).
+                const hasValue = (v) => typeof v === 'string' && v.trim() !== '';
+                const mediaUpdate = {};
+                if (hasValue(logoUrl) && !hasValue(token.logoUrl)) mediaUpdate.logoUrl = logoUrl;
+                if (hasValue(bannerUrl) && !hasValue(token.bannerUrl)) mediaUpdate.bannerUrl = bannerUrl;
+                if (Object.keys(mediaUpdate).length > 0) {
+                    token = await supabaseService.updateToken(tokenAddress, mediaUpdate, chain);
                 }
                 return { token, bondingCurve, isNew: false };
             }

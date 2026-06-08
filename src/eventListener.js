@@ -1,5 +1,5 @@
 const ethers = require("ethers");
-const { httpRpcUrl, wsRpcUrl, virtualEthLpInitial, virtualTokenLpInitial, realEthLpInitial, realTokenLpInitial, bondingLimit } = require('./config');
+const { httpRpcUrl, wsRpcUrl, virtualEthLpInitial, virtualTokenLpInitial, realEthLpInitial, realTokenLpInitial, bondingLimit, factoryDeployBlock } = require('./config');
 const supabaseService = require('./services/supabaseService');
 const { getEvmChainSlug } = require('./lib/chainUtils');
 
@@ -24,6 +24,7 @@ class EventListener {
         this.lastBondingCurveBlocks = new Map(); // Track last processed block per bonding curve
         this.consecutivePollFailures = 0; // Track failures for staleness detection
         this.isRecycling = false; // Prevent overlapping recycle
+        this.isPolling = false; // Prevent overlapping poll runs (setInterval does not await)
     }
 
     /**
@@ -810,82 +811,107 @@ class EventListener {
             try {
                 const tokenService = require('./services/tokenService');
                 const bondingCurve = await tokenService.getBondingCurveByAddress(bondingCurveAddress);
-                
+
                 if (!bondingCurve) {
                     console.error(`✗ Bonding curve not found: ${bondingCurveAddress}`);
                     return;
                 }
 
-                // Get current LP values with fallback to initial config values if missing/zero
-                const currentVirtualEthLp = (bondingCurve.virtualEthLp && BigInt(bondingCurve.virtualEthLp) > 0n) 
-                    ? bondingCurve.virtualEthLp 
-                    : virtualEthLpInitial || '10000000000000000';
-                const currentVirtualTokenLp = (bondingCurve.virtualTokenLp && BigInt(bondingCurve.virtualTokenLp) > 0n) 
-                    ? bondingCurve.virtualTokenLp 
-                    : virtualTokenLpInitial || '1073000000000000000000000';
-                const currentRealEthLp = bondingCurve.realEthLp || '0';
-                const currentRealTokenLp = bondingCurve.realTokenLp || realTokenLpInitial || '200000000000000000000000000';
-                
-                // Convert to BigInt for calculations
-                const virtualEthLpBig = BigInt(currentVirtualEthLp);
-                const virtualTokenLpBig = BigInt(currentVirtualTokenLp);
-                const realEthLpBig = BigInt(currentRealEthLp);
-                const ethAmountBig = BigInt(amount.toString());
-                const tokenAmountBig = BigInt(tokenAmount?.toString() || '0');
-                
-                // Calculate new LP values based on trade type
-                let newVirtualEthLp, newVirtualTokenLp, newRealEthLp;
-                
-                if (isBuy) {
-                    newVirtualEthLp = (virtualEthLpBig + ethAmountBig).toString();
-                    newVirtualTokenLp = virtualTokenLpBig >= tokenAmountBig 
-                        ? (virtualTokenLpBig - tokenAmountBig).toString() 
-                        : currentVirtualTokenLp; // Preserve current value to prevent data corruption
-                    newRealEthLp = (realEthLpBig + ethAmountBig).toString();
-                } else {
-                    newVirtualEthLp = virtualEthLpBig >= ethAmountBig 
-                        ? (virtualEthLpBig - ethAmountBig).toString() 
-                        : '0';
-                    newVirtualTokenLp = (virtualTokenLpBig + tokenAmountBig).toString();
-                    newRealEthLp = realEthLpBig >= ethAmountBig 
-                        ? (realEthLpBig - ethAmountBig).toString() 
-                        : '0';
-                }
-                
-                // Recalculate k = virtual_eth_lp * virtual_token_lp
-                const newVirtualEthLpBig = BigInt(newVirtualEthLp);
-                const newVirtualTokenLpBig = BigInt(newVirtualTokenLp);
-                const newK = (newVirtualEthLpBig > 0n && newVirtualTokenLpBig > 0n)
-                    ? (newVirtualEthLpBig * newVirtualTokenLpBig).toString()
-                    : '0';
-                
-                // Update bonding curve
+                // Read authoritative reserves/price/k/volume directly from the contract so DB values
+                // self-heal: a missed or duplicated TokenTraded event no longer skews every later
+                // value (the old code accumulated deltas off the previous DB row). Falls back to the
+                // legacy delta math only if the on-chain read fails.
+                const onChain = await this.readBondingCurveStateOnChain(bondingCurveAddress, eventBlockNumber);
+
+                // Counts are backend-only (not exposed on-chain); increment once per tx. Safe because
+                // the price-data dedup above guarantees this block runs at most once per transaction.
                 const updateData = {
-                    currentPrice: closePrice.toString(),
-                    volume: (BigInt(bondingCurve.volume || '0') + ethAmountBig).toString(),
-                    totalTrades: (bondingCurve.totalTrades || 0) + 1,
-                    virtualEthLp: newVirtualEthLp,
-                    virtualTokenLp: newVirtualTokenLp,
-                    realEthLp: newRealEthLp,
-                    realTokenLp: currentRealTokenLp,
-                    k: newK,
-                    lpCreated: BigInt(newRealEthLp) >= BigInt(bondingLimit || '0')
+                    totalTrades: (bondingCurve.totalTrades || 0) + 1
                 };
-                
                 if (isBuy) {
                     updateData.totalBuyers = (bondingCurve.totalBuyers || 0) + 1;
                 } else {
                     updateData.totalSellers = (bondingCurve.totalSellers || 0) + 1;
                 }
-                
+
+                if (onChain) {
+                    // Absolute on-chain truth — idempotent and self-correcting.
+                    updateData.virtualEthLp = onChain.virtualEthLp;
+                    updateData.virtualTokenLp = onChain.virtualTokenLp;
+                    updateData.realEthLp = onChain.realEthLp;
+                    updateData.realTokenLp = onChain.realTokenLp;
+                    updateData.k = onChain.k;
+                    updateData.currentPrice = (onChain.currentPrice && onChain.currentPrice !== '0')
+                        ? onChain.currentPrice
+                        : closePrice.toString();
+                    updateData.volume = onChain.volume;
+                    updateData.lpCreated = onChain.lpCreated || BigInt(onChain.realEthLp) >= BigInt(bondingLimit || '0');
+                } else {
+                    // Fallback: derive from previous DB values + this trade's deltas (legacy behaviour).
+                    console.warn(`  ⚠ On-chain read failed for ${bondingCurveAddress}; using delta fallback`);
+                    const currentVirtualEthLp = (bondingCurve.virtualEthLp && BigInt(bondingCurve.virtualEthLp) > 0n)
+                        ? bondingCurve.virtualEthLp
+                        : virtualEthLpInitial || '10000000000000000';
+                    const currentVirtualTokenLp = (bondingCurve.virtualTokenLp && BigInt(bondingCurve.virtualTokenLp) > 0n)
+                        ? bondingCurve.virtualTokenLp
+                        : virtualTokenLpInitial || '1073000000000000000000000';
+                    const currentRealEthLp = bondingCurve.realEthLp || '0';
+                    const currentRealTokenLp = bondingCurve.realTokenLp || realTokenLpInitial || '200000000000000000000000000';
+
+                    const virtualEthLpBig = BigInt(currentVirtualEthLp);
+                    const virtualTokenLpBig = BigInt(currentVirtualTokenLp);
+                    const realEthLpBig = BigInt(currentRealEthLp);
+                    const ethAmountBig = BigInt(amount.toString());
+                    const tokenAmountBig = BigInt(tokenAmount?.toString() || '0');
+
+                    let newVirtualEthLp, newVirtualTokenLp, newRealEthLp;
+                    if (isBuy) {
+                        newVirtualEthLp = (virtualEthLpBig + ethAmountBig).toString();
+                        newVirtualTokenLp = virtualTokenLpBig >= tokenAmountBig
+                            ? (virtualTokenLpBig - tokenAmountBig).toString()
+                            : currentVirtualTokenLp; // Preserve current value to prevent data corruption
+                        newRealEthLp = (realEthLpBig + ethAmountBig).toString();
+                    } else {
+                        newVirtualEthLp = virtualEthLpBig >= ethAmountBig
+                            ? (virtualEthLpBig - ethAmountBig).toString()
+                            : '0';
+                        newVirtualTokenLp = (virtualTokenLpBig + tokenAmountBig).toString();
+                        newRealEthLp = realEthLpBig >= ethAmountBig
+                            ? (realEthLpBig - ethAmountBig).toString()
+                            : '0';
+                    }
+
+                    const newVirtualEthLpBig = BigInt(newVirtualEthLp);
+                    const newVirtualTokenLpBig = BigInt(newVirtualTokenLp);
+                    const newK = (newVirtualEthLpBig > 0n && newVirtualTokenLpBig > 0n)
+                        ? (newVirtualEthLpBig * newVirtualTokenLpBig).toString()
+                        : '0';
+
+                    updateData.currentPrice = closePrice.toString();
+                    updateData.volume = (BigInt(bondingCurve.volume || '0') + ethAmountBig).toString();
+                    updateData.virtualEthLp = newVirtualEthLp;
+                    updateData.virtualTokenLp = newVirtualTokenLp;
+                    updateData.realEthLp = newRealEthLp;
+                    updateData.realTokenLp = currentRealTokenLp;
+                    updateData.k = newK;
+                    updateData.lpCreated = BigInt(newRealEthLp) >= BigInt(bondingLimit || '0');
+                }
+
                 await tokenService.updateBondingCurve(bondingCurveAddress, updateData);
-                
+
                 if (updateData.lpCreated && !bondingCurve.lpCreated) {
-                    console.log(`🎉 LP Created! real_eth_lp (${newRealEthLp}) >= bondingLimit (${bondingLimit || '0'})`);
+                    console.log(`🎉 LP Created! real_eth_lp (${updateData.realEthLp}) >= bondingLimit (${bondingLimit || '0'})`);
                 }
             } catch (err) {
                 console.error(`✗ Error updating bonding curve:`, err.message);
             }
+
+            // Refresh the trader's on-chain holder balance (fire-and-forget; cron does full sync).
+            try {
+                require('./services/holderService')
+                    .refreshEvmAddresses(tokenAddressLower, bondingCurveAddress, getEvmChainSlug(), [toAddr(trader)])
+                    .catch(() => {});
+            } catch (e) { /* ignore */ }
 
             console.log(`  ✓ Trade processed and saved: ${isBuy ? 'BUY' : 'SELL'} ${amount.toString()} ETH, ${tokenAmount ? tokenAmount.toString() : '0'} tokens @ ${closePrice.toString()}`);
         } catch (error) {
@@ -893,6 +919,66 @@ class EventListener {
             console.error(`    Bonding Curve: ${bondingCurveAddress}`);
             console.error(`    Transaction: ${event?.transactionHash || 'unknown'}`);
             // Don't rethrow - we want to continue processing other events
+        }
+    }
+
+    /**
+     * Read authoritative bonding-curve state directly from the contract.
+     * Used to make DB reserves/price/k/volume self-healing instead of accumulating trade deltas
+     * (a single missed or duplicated TokenTraded event would otherwise skew every later value).
+     * Reads at `blockTag` (the trade's block) when the node serves that state, otherwise falls
+     * back to latest. Returns null if all reads fail (caller then uses the delta fallback).
+     * @param {string} bondingCurveAddress
+     * @param {number} [blockTag] block to read state at (point-in-time accuracy; needs the node
+     *   to retain that state — recent blocks on most public RPCs, all blocks on archive nodes)
+     * @returns {Promise<{virtualEthLp,virtualTokenLp,realEthLp,realTokenLp,k,currentPrice,volume,lpCreated}|null>}
+     */
+    async readBondingCurveStateOnChain(bondingCurveAddress, blockTag) {
+        if (!this.provider) {
+            return null;
+        }
+        const normalized = bondingCurveAddress.toLowerCase();
+        const contract = this.bondingCurveListeners.get(normalized)?.contract
+            || new ethers.Contract(normalized, BONDING_CURVE_ABI, this.provider);
+
+        const readAll = async (overrides) => {
+            const [virtualEthLp, virtualTokenLp, realEthLp, realTokenLp, k, currentPrice, volume, lpCreated] = await Promise.all([
+                contract.virtualEthLp(overrides),
+                contract.virtualTokenLp(overrides),
+                contract.realEthLp(overrides),
+                contract.realTokenLp(overrides),
+                contract.k(overrides),
+                contract.currentTokenPrice(overrides),
+                contract.volume(overrides),
+                contract.lpCreated(overrides)
+            ]);
+            return {
+                virtualEthLp: virtualEthLp.toString(),
+                virtualTokenLp: virtualTokenLp.toString(),
+                realEthLp: realEthLp.toString(),
+                realTokenLp: realTokenLp.toString(),
+                k: k.toString(),
+                currentPrice: currentPrice.toString(),
+                volume: volume.toString(),
+                lpCreated: Boolean(lpCreated)
+            };
+        };
+
+        // Try at the trade's block first (point-in-time accurate); fall back to latest if the node
+        // can't serve that historical state (no archive), then give up so the caller can fall back.
+        const bn = Number(blockTag);
+        if (Number.isFinite(bn) && bn > 0) {
+            try {
+                return await readAll({ blockTag: bn });
+            } catch (err) {
+                // Historical state unavailable — fall through to latest.
+            }
+        }
+        try {
+            return await readAll({});
+        } catch (err) {
+            console.error(`  ⚠ Failed to read on-chain bonding curve state for ${normalized}: ${err.message}`);
+            return null;
         }
     }
 
@@ -906,18 +992,27 @@ class EventListener {
 
         try {
             const latestBlock = await this.provider.getBlockNumber();
-            
+
             // Find last processed token creation from database
             const tokenService = require('./services/tokenService');
             const tokens = await tokenService.getAllTokens({ limit: 1, sortBy: 'blockNumber', sortOrder: -1 });
-            const lastBlock = tokens && tokens.tokens && tokens.tokens.length > 0 
-                ? tokens.tokens[0].blockNumber 
-                : (this.lastFactoryBlock || 0);
-            
-            const startBlock = Math.max(lastBlock, this.lastFactoryBlock || 0) + 1;
-            
+            const lastDbBlock = tokens && tokens.tokens && tokens.tokens.length > 0
+                ? Number(tokens.tokens[0].blockNumber)
+                : 0;
+
+            // Highest block we've already processed (DB or in-memory)
+            const lastProcessed = Math.max(lastDbBlock, this.lastFactoryBlock || 0);
+
+            // Never scan before the factory deploy block. Without this, a fresh/empty DB
+            // would scan from block 1 across the entire chain (millions of queryFilter calls).
+            const startBlock = Math.max(lastProcessed + 1, factoryDeployBlock || 0);
+
             if (startBlock > latestBlock) {
                 return; // Already up to date
+            }
+
+            if (!factoryDeployBlock && lastProcessed === 0) {
+                console.warn('⚠ FACTORY_DEPLOY_BLOCK not set and DB is empty — factory catch-up will scan from block 1. Set FACTORY_DEPLOY_BLOCK in .env to the factory deploy block to avoid this.');
             }
 
             console.log(`Catching up factory events from block ${startBlock} to ${latestBlock}...`);
@@ -1193,6 +1288,9 @@ class EventListener {
         }
         this.isRecycling = true;
         console.log(`[EVM] Force recycling (reason: ${reason})...`);
+        // Clear the polling guard: a poll mid-flight against the old (now-destroyed) provider
+        // will reject and run its finally, but reset here too so the fresh interval is never blocked.
+        this.isPolling = false;
         try {
             if (this.pollingInterval) {
                 clearInterval(this.pollingInterval);
@@ -1272,10 +1370,20 @@ class EventListener {
         if (this.isRecycling || !this.provider || this.bondingCurveListeners.size === 0) {
             return; // Recycle in progress, no provider, or no bonding curves to poll
         }
+        if (this.isPolling) {
+            // A previous poll is still running. setInterval does not await the callback, so
+            // overlapping runs would race the per-curve lastBlock cursor and multiply RPC
+            // load (more 429s → more missed events). Skip; the cursor is preserved for next tick.
+            return;
+        }
+        this.isPolling = true;
 
         try {
             const latestBlock = await this.provider.getBlockNumber();
-            this.consecutivePollFailures = 0; // Success - reset failure count
+            // Do NOT reset consecutivePollFailures here. getBlockNumber() succeeding while
+            // eth_getLogs fails must still count as a failed cycle, otherwise the recycle
+            // safety-net never fires while trade events are silently missed.
+            let cycleHadFailure = false;
             // RPC providers often limit eth_getLogs range (e.g. 1000–2000 blocks)
             const pollBatchSize = 200;
 
@@ -1310,6 +1418,7 @@ class EventListener {
                         );
 
                         let maxProcessedBlock = lastBlock;
+                        let minFailedBlock = null; // earliest block whose handler threw this batch
                         if (events.length > 0 || traderFeeEvents.length > 0) {
                             console.log(`\n📊 Found ${events.length} TokenTraded and ${traderFeeEvents.length} TraderFee event(s) for ${address} (blocks ${fromBlock}-${toBlock})`);
                         }
@@ -1340,6 +1449,8 @@ class EventListener {
                                 if (eb > maxProcessedBlock) maxProcessedBlock = eb;
                             } catch (error) {
                                 console.error(`  ✗ Error processing TokenTraded:`, error.message, `TX: ${event.transactionHash}`);
+                                const fb = typeof event.blockNumber === 'number' ? event.blockNumber : Number(event.blockNumber);
+                                if (Number.isFinite(fb)) minFailedBlock = minFailedBlock == null ? fb : Math.min(minFailedBlock, fb);
                             }
                         }
 
@@ -1367,18 +1478,45 @@ class EventListener {
                                 if (eb > maxProcessedBlock) maxProcessedBlock = eb;
                             } catch (error) {
                                 console.error(`  ✗ Error processing TraderFee:`, error.message, `TX: ${event.transactionHash}`);
+                                const fb = typeof event.blockNumber === 'number' ? event.blockNumber : Number(event.blockNumber);
+                                if (Number.isFinite(fb)) minFailedBlock = minFailedBlock == null ? fb : Math.min(minFailedBlock, fb);
                             }
                         }
 
-                        // Advance lastBlock to end of this batch so we never re-scan or skip blocks
+                        // Decide how far to advance the cursor for this curve.
                         const endBlock = toBlock;
                         const updatedData = this.bondingCurveListeners.get(address);
-                        if (updatedData) {
-                            updatedData.lastBlock = Math.max(maxProcessedBlock, endBlock);
+                        let newLastBlock = Math.max(maxProcessedBlock, endBlock);
+                        let holdForRetry = false;
+
+                        if (minFailedBlock != null) {
+                            // A handler (not the RPC query) failed for an event in this batch.
+                            // Hold the cursor just before the failed block so the next poll
+                            // retries it instead of advancing past it — advancing would leave a
+                            // permanent gap once a later trade is stored (periodic catch-up starts
+                            // from the latest stored trade). Bounded so a poison event cannot stall
+                            // the curve indefinitely; already-stored events are skipped via dedup.
+                            const retries = (updatedData && updatedData.failRetries) || 0;
+                            if (retries < 3) {
+                                newLastBlock = Math.max(lastBlock, minFailedBlock - 1);
+                                if (updatedData) updatedData.failRetries = retries + 1;
+                                holdForRetry = true;
+                            } else {
+                                console.warn(`  ⚠ [EVM] Skipping block ${minFailedBlock} for ${address} after ${retries} failed retries`);
+                                if (updatedData) updatedData.failRetries = 0;
+                            }
+                        } else if (updatedData) {
+                            updatedData.failRetries = 0;
                         }
-                        this.lastBondingCurveBlocks.set(address, Math.max(maxProcessedBlock, endBlock));
+
+                        if (updatedData) updatedData.lastBlock = newLastBlock;
+                        this.lastBondingCurveBlocks.set(address, newLastBlock);
+
+                        // Stop scanning further batches this cycle; resume from the held block next poll.
+                        if (holdForRetry) break;
                     }
                 } catch (error) {
+                    cycleHadFailure = true; // an eth_getLogs / RPC query failed for this curve
                     console.error(`  ✗ Error polling ${address}:`, error.message);
                     // Invalid block range indicates WebSocket/provider degradation - recycle immediately
                     if (error.message && String(error.message).includes('invalid block range')) {
@@ -1392,6 +1530,18 @@ class EventListener {
                     }
                 }
             }
+
+            // Count the cycle: a clean cycle resets the counter; any RPC failure advances
+            // toward a recycle even when getBlockNumber() itself is still working.
+            if (cycleHadFailure) {
+                this.consecutivePollFailures = (this.consecutivePollFailures || 0) + 1;
+                if (this.consecutivePollFailures >= POLL_FAILURE_THRESHOLD) {
+                    console.warn(`[EVM] ${this.consecutivePollFailures} consecutive poll failures - triggering recycle`);
+                    this.forceRecycleEVM('consecutive-poll-failures').catch(() => {});
+                }
+            } else {
+                this.consecutivePollFailures = 0;
+            }
         } catch (error) {
             this.consecutivePollFailures = (this.consecutivePollFailures || 0) + 1;
             console.error(`Error in pollForBondingCurveEvents (failures: ${this.consecutivePollFailures}):`, error.message);
@@ -1399,6 +1549,8 @@ class EventListener {
                 console.warn(`[EVM] ${this.consecutivePollFailures} consecutive poll failures - triggering recycle`);
                 this.forceRecycleEVM('consecutive-poll-failures').catch(() => {});
             }
+        } finally {
+            this.isPolling = false;
         }
     }
 

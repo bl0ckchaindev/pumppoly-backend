@@ -41,6 +41,7 @@ class SolanaEventListener {
         this.pollingInterval = null;
         this.processedSignatures = new Set(); // Track processed transactions
         this.eventCoder = null; // Anchor event coder
+        this.isProcessing = false; // Prevent overlapping processNewTransactions runs (poll + subscription)
     }
 
     /**
@@ -177,8 +178,8 @@ class SolanaEventListener {
      */
     setupSubscription() {
         try {
-            // Subscribe to program account changes
-            this.connection.onProgramAccountChange(
+            // Subscribe to program account changes (store id so stopListening can unsubscribe)
+            this.subscriptionId = this.connection.onProgramAccountChange(
                 PROGRAM_ID,
                 async (accountInfo, context) => {
                     try {
@@ -197,91 +198,131 @@ class SolanaEventListener {
     }
 
     /**
-     * Process new transactions since last check
+     * Collect program signatures we have not processed yet, paging backward from the
+     * newest until we reach a page that is entirely already-processed (or run out of
+     * pages / hit the page cap).
+     *
+     * Without paging, a burst of more than `pageSize` program transactions between two
+     * polls would scroll the older signatures out of the single result window and they
+     * would be missed forever. Paging past already-processed signatures (instead of
+     * stopping at the first one) also tolerates holes, so a transaction left unprocessed
+     * by an earlier error is retried on the next poll even if newer ones already landed.
+     *
+     * @returns {Promise<string[]>} signatures oldest-first, ready to process in order
+     */
+    async collectNewSignatures(maxPages = 20, pageSize = 100) {
+        const collected = [];
+        let before = undefined;
+
+        for (let page = 0; page < maxPages; page++) {
+            let sigs;
+            try {
+                sigs = await this.connection.getSignaturesForAddress(
+                    PROGRAM_ID,
+                    { limit: pageSize, before, commitment: 'confirmed' }
+                );
+            } catch (err) {
+                // Transient RPC error (e.g. 429): stop paging and process what we have.
+                console.error('Error fetching Solana signatures:', err.message);
+                break;
+            }
+            if (!sigs || sigs.length === 0) break;
+
+            let anyNew = false;
+            for (const s of sigs) {
+                const signature = s.signature;
+                if (s.err) { this.processedSignatures.add(signature); continue; } // failed tx
+                if (this.processedSignatures.has(signature)) continue;
+                let inDb = false;
+                try {
+                    inDb = await supabaseService.isSolanaTransactionProcessed(signature);
+                } catch (e) {
+                    // DB check failed — treat as new; the insert is idempotent on tx hash.
+                }
+                if (inDb) { this.processedSignatures.add(signature); continue; }
+                collected.push(signature);
+                anyNew = true;
+            }
+
+            // A full page with nothing new means we have reached the processed frontier.
+            if (!anyNew) break;
+            if (sigs.length < pageSize) break; // no older pages exist
+            before = sigs[sigs.length - 1].signature;
+        }
+
+        return collected.reverse(); // oldest first
+    }
+
+    /**
+     * Process new transactions since last check.
      */
     async processNewTransactions() {
+        if (this.isProcessing) {
+            // Both the 5s poll and the onProgramAccountChange subscription call this. Without
+            // a guard, concurrent runs double-fetch the same transactions (wasted RPC → more
+            // 429s) and can re-enter handlers before signatures are marked processed.
+            return;
+        }
+        this.isProcessing = true;
         try {
-            // Get recent signatures for the program
-            const signatures = await this.connection.getSignaturesForAddress(
-                PROGRAM_ID,
-                {
-                    limit: 100,
-                    commitment: 'confirmed'
-                }
-            );
+            await this._processNewTransactions();
+        } finally {
+            this.isProcessing = false;
+        }
+    }
 
-            // Process transactions in reverse order (oldest first)
-            for (const sigInfo of signatures.reverse()) {
-                const signature = sigInfo.signature;
-                
-                // Skip if already processed (in-memory)
-                if (this.processedSignatures.has(signature)) {
-                    continue;
-                }
+    async _processNewTransactions() {
+        const newSignatures = await this.collectNewSignatures();
 
-                // Skip if already in DB (avoids getTransaction RPC for confirmed txs → reduces 429)
-                try {
-                    const alreadyProcessed = await supabaseService.isSolanaTransactionProcessed(signature);
-                    if (alreadyProcessed) {
-                        this.processedSignatures.add(signature);
-                        continue;
-                    }
-                } catch (dbCheckErr) {
-                    // If DB check fails, proceed to fetch tx (don't block on Supabase)
-                }
+        for (const signature of newSignatures) {
+            let tx;
+            try {
+                tx = await this.connection.getTransaction(signature, {
+                    commitment: 'confirmed',
+                    maxSupportedTransactionVersion: 0
+                });
+            } catch (error) {
+                // Transient RPC error: do NOT mark processed — retry on the next poll.
+                console.error(`Error fetching transaction ${signature}:`, error.message);
+                const is429 = (error.message || '').includes('429') || /too many requests/i.test(error.message || '');
+                if (is429) break; // back off for this cycle; the next poll retries
+                continue;
+            }
 
-                try {
-                    // Get transaction details
-                    const tx = await this.connection.getTransaction(signature, {
-                        commitment: 'confirmed',
-                        maxSupportedTransactionVersion: 0
-                    });
+            if (!tx) {
+                // Not yet available at this commitment — leave unprocessed for the next poll.
+                continue;
+            }
+            if (!tx.meta || tx.meta.err) {
+                // Failed/irrelevant tx — mark processed so we don't keep refetching it.
+                this.processedSignatures.add(signature);
+                continue;
+            }
 
-                    if (!tx || !tx.meta || tx.meta.err) {
-                        // Transaction failed or doesn't exist
-                        this.processedSignatures.add(signature);
-                        continue;
-                    }
-
-                    // Process events from transaction
-                    try {
-                        await this.processTransactionEvents(tx, signature);
-                        // Mark as processed only if no errors occurred
-                        this.processedSignatures.add(signature);
-                    } catch (eventError) {
-                        // Handle duplicate key errors gracefully (don't retry)
-                        if (eventError.message && (
-                            eventError.message.includes('duplicate key') ||
-                            eventError.message.includes('unique constraint') ||
-                            eventError.code === '23505' ||
-                            eventError.code === 'PGRST204'
-                        )) {
-                            console.log(`  ℹ Transaction ${signature} already processed (duplicate), marking as processed`);
-                            this.processedSignatures.add(signature);
-                            // Don't throw - duplicate is expected in race conditions
-                        } else {
-                            console.error(`  ✗ Failed to process events for ${signature}:`, eventError.message);
-                            // Don't mark as processed so we can retry non-duplicate errors
-                            throw eventError;
-                        }
-                    }
-                    
-                    // Keep only last 1000 processed signatures
-                    if (this.processedSignatures.size > 1000) {
-                        const first = Array.from(this.processedSignatures)[0];
-                        this.processedSignatures.delete(first);
-                    }
-                } catch (error) {
-                    console.error(`Error processing transaction ${signature}:`, error.message);
-                    // Mark as processed on RPC errors (e.g. 429) so we don't retry the same tx in a loop
-                    const is429 = (error.message || '').includes('429') || (error.message || '').includes('Too Many Requests');
-                    if (is429) {
-                        this.processedSignatures.add(signature);
-                    }
+            try {
+                await this.processTransactionEvents(tx, signature);
+                this.processedSignatures.add(signature);
+            } catch (eventError) {
+                if (eventError.message && (
+                    eventError.message.includes('duplicate key') ||
+                    eventError.message.includes('unique constraint') ||
+                    eventError.code === '23505' ||
+                    eventError.code === 'PGRST204'
+                )) {
+                    // Already stored (race) — safe to mark processed.
+                    this.processedSignatures.add(signature);
+                } else {
+                    // Real failure — leave unprocessed so the next poll retries it.
+                    console.error(`  ✗ Failed to process events for ${signature}:`, eventError.message);
                 }
             }
-        } catch (error) {
-            console.error('Error processing new transactions:', error.message);
+
+            // Bound the in-memory set well above one poll's worth of signatures so the
+            // paging frontier is not evicted between polls.
+            if (this.processedSignatures.size > 5000) {
+                const first = this.processedSignatures.values().next().value;
+                this.processedSignatures.delete(first);
+            }
         }
     }
 
@@ -628,25 +669,76 @@ class SolanaEventListener {
                 return; // Bonding curve not found - token might not be indexed yet
             }
 
-            console.log(`  📝 Updating bonding curve: ${bondingCurveAddress}`);
+            console.log(`  📝 Processing trade for bonding curve: ${bondingCurveAddress}`);
 
-            // Add trade to history and price data
             const blockTime = transaction.blockTime || Math.floor(Date.now() / 1000);
             const slot = transaction.slot || 0;
-            
-            // Solana: store "token base units (6 decimals) per 1 SOL" for frontend formula:
-            // TokenPrice USD = (1e9 * solPrice) / current_price. So current_price = baseAmount * 1e9 / quoteAmount.
-            // (baseAmount = token raw units in trade, quoteAmount = SOL lamports; 1 SOL = 1e9 lamports)
-            console.log('[god-log] baseAmount', baseAmount);
-            console.log('[god-log] quoteAmount', quoteAmount);
-            const price = quoteAmount && baseAmount && BigInt(quoteAmount) > 0n
-                ? ((BigInt(baseAmount) * BigInt(1e9)) / (BigInt(quoteAmount) * BigInt(1e6))).toString()
+
+            // Solana token price = SOL per token, scaled by 1e15 — same convention as EVM
+            // (ETH per token × 1e15), so the price RISES on buys and the chart reads correctly.
+            //   SOL/token = (quote_lamports/1e9) / (base_units/1e6); ×1e15 => quote*1e12 / base.
+            // (baseAmount = token base units traded; quoteAmount = SOL lamports.)
+            const price = quoteAmount && baseAmount && BigInt(baseAmount) > 0n
+                ? ((BigInt(quoteAmount) * 1000000000000n) / BigInt(baseAmount)).toString()
                 : '0';
-            console.log('[god-log] price', price);
             // Calculate k value (constant product: virtual_eth_lp * virtual_token_lp)
             const kValue = (BigInt(virtualQuoteReserves) * BigInt(virtualBaseReserves)).toString();
-            
-            // Update bonding curve reserves with current price
+
+            // Open price: previous price, or for the first buy the initial curve price in the same
+            // unit: virtual_quote*1e12 / virtual_base (SOL per token × 1e15).
+            const hasPreviousPrice = bondingCurve.currentPrice && bondingCurve.currentPrice !== '0';
+            let openPrice;
+            if (hasPreviousPrice) {
+                openPrice = bondingCurve.currentPrice;
+            } else {
+                const vBase = BigInt(virtualBaseReserves);
+                const vQuote = BigInt(virtualQuoteReserves);
+                openPrice = vBase > 0n ? ((vQuote * 1000000000000n) / vBase).toString() : price;
+            }
+
+            // Insert price data FIRST as the idempotency gate (token_price_data.transaction_hash
+            // is unique). If this trade is already recorded, return before touching the bonding
+            // curve — otherwise a retry (e.g. a TRADER_FEE insert in the same tx failing) would
+            // increment `volume` again. Reserves come from the event's absolute "before" snapshot
+            // so re-applying them is harmless, but volume is accumulated and must run once per tx.
+            let priceInserted = null;
+            try {
+                priceInserted = await supabaseService.addTokenPriceData({
+                    tokenAddress: mint,
+                    chain: 'solana',
+                    timestamp: blockTime,
+                    openPrice: openPrice, // Previous price (token base units per 1 SOL)
+                    closePrice: price,    // New price after trade (token base units per 1 SOL)
+                    amount: BigInt(quoteAmount).toString(), // SOL lamports (chart scales by 1e9)
+                    trader: user,
+                    isBuy: tradeType,
+                    transactionHash: signature,
+                    blockNumber: slot
+                });
+                if (priceInserted) {
+                    console.log(`  ✅ Token price data saved for chart: ${signature}`);
+                }
+            } catch (priceError) {
+                if (priceError.message && (
+                    priceError.message.includes('duplicate key') ||
+                    priceError.message.includes('unique constraint') ||
+                    priceError.code === '23505' ||
+                    priceError.code === 'PGRST204'
+                )) {
+                    priceInserted = null; // already recorded
+                } else {
+                    // Transient failure inserting price data: rethrow so the whole tx is retried.
+                    throw priceError;
+                }
+            }
+
+            if (!priceInserted) {
+                console.log(`  ℹ Trade ${signature} already recorded, skipping curve/volume update`);
+                return;
+            }
+
+            // Update bonding curve reserves, price, k and (accumulated) volume — runs once per tx.
+            // Non-fatal: a failure here must NOT retry the tx (that would re-run the volume add).
             try {
                 await supabaseService.updateBondingCurve(bondingCurveAddress, {
                     chain: 'solana', // Required for address normalization
@@ -661,76 +753,6 @@ class SolanaEventListener {
                 console.log(`  ✅ Bonding curve updated successfully (price: ${price})`);
             } catch (updateError) {
                 console.error(`  ✗ Failed to update bonding curve:`, updateError.message);
-                console.error(`  Update data:`, {
-                    bondingCurveAddress,
-                    chain: 'solana',
-                    realEthLp: realQuoteReserves,
-                    realTokenLp: realBaseReserves,
-                    virtualEthLp: virtualQuoteReserves,
-                    virtualTokenLp: virtualBaseReserves,
-                    k: kValue,
-                    currentPrice: price
-                });
-                throw updateError;
-            }
-            
-            // Save token price data for charts (IMPORTANT: this feeds the TradingViewChart)
-            try {
-                // Open price: previous price (bonding curve current) or for first buy use initial curve price.
-                // Initial price = Virtual token amount / Virtual SOL amount (same unit as trade price: token base units per 1 SOL).
-                // e.g. virtual_base=1073000000000000 (6 decimals) -> 1073000000, virtual_quote=30e9 lamports -> 30 SOL => 1073000000/30 = 35766667.
-                const hasPreviousPrice = bondingCurve.currentPrice && bondingCurve.currentPrice !== '0';
-                let openPrice;
-                if (hasPreviousPrice) {
-                    openPrice = bondingCurve.currentPrice;
-                } else {
-                    // First buy: compute initial price from pre-trade virtual reserves (virtual_base_before, virtual_quote_before).
-                    // Initial price = (virtual_base/1e6) / (virtual_quote/1e9) = virtual_base*1e9/(virtual_quote*1e6); same unit as trade price (token base per 1 SOL).
-                    // e.g. 1073000000/30 = 35766666.67 -> 35766667.
-                    const vBase = BigInt(virtualBaseReserves);
-                    const vQuote = BigInt(virtualQuoteReserves);
-                    if (vQuote > 0n) {
-                        const denom = vQuote * 1000000n;
-                        const num = vBase * 1000000000n;
-                        const q = num / denom;
-                        const r = num % denom;
-                        const initialPriceBig = r >= denom / 2n ? q + 1n : q;
-                        openPrice = initialPriceBig.toString();
-                    } else {
-                        openPrice = price;
-                    }
-                }
-
-                // Scale amount from lamports (10^9) to wei-compatible (10^18) for chart volume
-                // Chart divides by 1e18, so: lamports * 10^9 / 1e18 = lamports / 1e9 = SOL
-                const scaledAmount = BigInt(quoteAmount).toString();
-                
-                await supabaseService.addTokenPriceData({
-                    tokenAddress: mint,
-                    chain: 'solana',
-                    timestamp: blockTime,
-                    openPrice: openPrice, // Previous price (token base units per 1 SOL)
-                    closePrice: price,    // New price after trade (token base units per 1 SOL)
-                    amount: scaledAmount, // SOL amount scaled to wei-equivalent for chart
-                    trader: user,
-                    isBuy: tradeType,
-                    transactionHash: signature,
-                    blockNumber: slot
-                });
-                console.log(`  ✅ Token price data saved for chart: ${signature}`);
-            } catch (priceError) {
-                // Handle duplicate key errors gracefully
-                if (priceError.message && (
-                    priceError.message.includes('duplicate key') ||
-                    priceError.message.includes('unique constraint') ||
-                    priceError.code === '23505' ||
-                    priceError.code === 'PGRST204'
-                )) {
-                    console.log(`  ℹ Price data ${signature} already exists, skipping (duplicate)`);
-                } else {
-                    console.error(`  ✗ Failed to save token price data:`, priceError.message);
-                    // Don't throw - we want to continue with trade history
-                }
             }
             
             // Save trade history
@@ -761,10 +783,15 @@ class SolanaEventListener {
                     // Don't throw - this is expected in race conditions
                 } else {
                     console.error(`  ✗ Failed to save trade history:`, historyError.message);
-                    // Only throw for non-duplicate errors
-                    throw historyError;
+                    // Non-fatal: price data (the idempotency gate) is already stored, so do NOT
+                    // rethrow — a retry would re-run the volume update above and double-count it.
                 }
             }
+
+            // Refresh the trader's on-chain holder balance (fire-and-forget; cron does full sync).
+            try {
+                require('./services/holderService').refreshSolanaAddress(mint, user, 'solana').catch(() => {});
+            } catch (e) { /* ignore */ }
 
             console.log(`✓ Processed Solana TRADE event: ${tradeType ? 'BUY' : 'SELL'} ${baseAmount} token units for ${quoteAmount} lamports @ price (token/1 SOL) ${price}`);
             console.log(`  ✅ Bonding curve updated: ${bondingCurveAddress}`);
@@ -1086,7 +1113,8 @@ class SolanaEventListener {
     async parseTraderFeeEvent(eventData, transaction, signature) {
         try {
             let offset = 8; // Skip discriminator
-            if (eventData.length < 8 + 32 + 32 + 1 + 8 + 8 + 8) {
+            // IDL layout: user(32) mint(32) trade_type(1) platform_fee(8) creator_fee(8) reward_fee(8) fee_amount(8)
+            if (eventData.length < 8 + 32 + 32 + 1 + 8 + 8 + 8 + 8) {
                 console.log('  ⚠ TRADER_FEE data too short, skipping');
                 return;
             }
@@ -1101,6 +1129,8 @@ class SolanaEventListener {
             offset += 8;
             const creatorFee = eventData.readBigUInt64LE(offset);
             offset += 8;
+            const rewardFee = eventData.readBigUInt64LE(offset);
+            offset += 8;
             const feeAmount = eventData.readBigUInt64LE(offset);
 
             await this.handleTraderFeeEvent({
@@ -1109,6 +1139,7 @@ class SolanaEventListener {
                 trade_type: tradeType,
                 platform_fee: platformFee,
                 creator_fee: creatorFee,
+                reward_fee: rewardFee,
                 fee_amount: feeAmount
             }, transaction, signature);
         } catch (error) {

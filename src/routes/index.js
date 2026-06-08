@@ -8,14 +8,11 @@ const traderFeeRoutes = require('./traderFeeRoutes');
 const rewardDistributionRoutes = require('./rewardDistributionRoutes');
 const configRoutes = require('./configRoutes');
 
-// Apply CORS headers to all routes
+// Security header for all routes. CORS headers are handled centrally by the cors()
+// middleware in index.js — do NOT set Access-Control-Allow-Origin: '*' here, it would
+// override the per-origin value and break credentialed requests.
 router.use((req, res, next) => {
     res.header("X-Frame-Options", "DENY");
-    res.header("Access-Control-Allow-Origin", "*");
-    res.header(
-        "Access-Control-Allow-Headers",
-        "Origin, X-Requested-With, Content-Type, Accept"
-    );
     next();
 });
 

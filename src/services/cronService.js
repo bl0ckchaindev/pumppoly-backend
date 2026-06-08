@@ -82,6 +82,34 @@ class CronService {
         rewardDistributionJob.start();
         console.log('✓ Cron job started: Reward distribution (check every 1 min)');
 
+        // Holder indexer: refresh on-chain holder balances for active tokens every 2 minutes.
+        const holderSyncJob = cron.schedule('*/2 * * * *', async () => {
+            try {
+                const holderService = require('./holderService');
+                const supabaseService = require('./supabaseService');
+                const evmChain = getEvmChainSlug();
+
+                // EVM: incremental Transfer-log scan + balanceOf refresh per token.
+                const evmTokens = await supabaseService.getActiveTokensForHolderSync(evmChain);
+                for (const t of evmTokens) {
+                    await holderService.syncEvmHolders(t.tokenAddress, t.bondingCurveAddress, t.chain, t.blockNumber);
+                    await new Promise((r) => setTimeout(r, 150)); // be gentle on the RPC
+                }
+
+                // Solana: full token-account rebuild per mint.
+                const solTokens = await supabaseService.getActiveTokensForHolderSync('solana');
+                for (const t of solTokens) {
+                    await holderService.syncSolanaHolders(t.tokenAddress, t.chain);
+                    await new Promise((r) => setTimeout(r, 300));
+                }
+            } catch (error) {
+                console.error('[Cron] Holder sync error:', error.message);
+            }
+        }, { scheduled: false });
+        this.jobs.push({ name: 'holderSync', job: holderSyncJob });
+        holderSyncJob.start();
+        console.log('✓ Cron job started: Holder indexer (every 2 min)');
+
         this.isRunning = true;
         console.log('Cron service started successfully');
     }

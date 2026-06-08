@@ -91,10 +91,21 @@ class SupabaseService {
 
     async updateToken(tokenAddress, updateData, chain = getEvmChainSlug()) {
         const address = isSolanaChain(chain) ? String(tokenAddress || '') : String(tokenAddress || '').toLowerCase();
+        const existing = await this.getTokenByAddress(tokenAddress, chain);
+        if (!existing) return null; // nothing to update
+        const hasValue = (v) => typeof v === 'string' && v.trim() !== '';
+
         const mappedData = {};
-        if (updateData.logoUrl !== undefined) mappedData.logo_url = String(updateData.logoUrl);
-        if (updateData.bannerUrl !== undefined) mappedData.banner_url = String(updateData.bannerUrl);
-        if (Object.keys(mappedData).length === 0) return await this.getTokenByAddress(tokenAddress, chain);
+        // Write-once for media on BOTH networks: only ever fill logo/banner that isn't already stored.
+        // Once set, it's immutable — this is the single chokepoint, so no caller can overwrite it.
+        if (updateData.logoUrl !== undefined && !(existing && hasValue(existing.logoUrl))) {
+            mappedData.logo_url = String(updateData.logoUrl);
+        }
+        if (updateData.bannerUrl !== undefined && !(existing && hasValue(existing.bannerUrl))) {
+            mappedData.banner_url = String(updateData.bannerUrl);
+        }
+        if (Object.keys(mappedData).length === 0) return existing;
+
         let query = supabase.from('tokens').update(mappedData).eq('token_address', address);
         if (chain) query = query.eq('chain', chain);
         const { data, error } = await query.select().single();
@@ -537,11 +548,17 @@ class SupabaseService {
 
             if (error) {
                 // Handle duplicate key errors (race conditions)
-                if (error.code === '23505' || error.code === 'PGRST204' || 
+                if (error.code === '23505' || error.code === 'PGRST204' ||
                     error.message?.includes('duplicate')) {
                     return null;
                 }
                 throw error;
+            }
+
+            // A genuinely new price point landed — recompute this token's 24h change.
+            // Fire-and-forget so ingestion isn't blocked; covers every trade path (live + catch-up).
+            if (data) {
+                this.refreshPriceChange24h(priceData.tokenAddress, chain).catch(() => {});
             }
 
             return data ? this.transformPriceData(data) : null;
@@ -581,6 +598,70 @@ class SupabaseService {
 
         if (error) throw error;
         return data.map(p => this.transformPriceData(p));
+    }
+
+    /**
+     * Compute a token's 24h price change (%) from token_price_data. Price is a ratio so the raw
+     * scaled close_price values cancel out. Returns a number (2 decimals) or null if no data.
+     * Mirrors the frontend: base = first point in the last 24h, else the earliest point.
+     */
+    async getPriceChange24h(tokenAddress, chain = null) {
+        const addr = normalizeAddress(tokenAddress, chain);
+        const cutoff = Math.floor(Date.now() / 1000) - 86400;
+
+        const latestQ = await supabase
+            .from('token_price_data')
+            .select('close_price, timestamp')
+            .eq('token_address', addr)
+            .order('timestamp', { ascending: false })
+            .limit(1);
+        const latest = latestQ.data && latestQ.data[0];
+        if (!latest) return null;
+
+        let baseQ = await supabase
+            .from('token_price_data')
+            .select('close_price, timestamp')
+            .eq('token_address', addr)
+            .gte('timestamp', cutoff)
+            .order('timestamp', { ascending: true })
+            .limit(1);
+        let base = baseQ.data && baseQ.data[0];
+        if (!base) {
+            const earliestQ = await supabase
+                .from('token_price_data')
+                .select('close_price, timestamp')
+                .eq('token_address', addr)
+                .order('timestamp', { ascending: true })
+                .limit(1);
+            base = earliestQ.data && earliestQ.data[0];
+        }
+        if (!base) return null;
+
+        const l = Number(latest.close_price);
+        const b = Number(base.close_price);
+        if (!isFinite(l) || !isFinite(b) || b <= 0) return null;
+        const change = Math.round(((l - b) / b) * 100 * 100) / 100;
+        // Clamp to the price_changed_24h column's NUMERIC(10,2) range.
+        return Math.max(-99999999.99, Math.min(99999999.99, change));
+    }
+
+    /** Persist a token's 24h price change (%) onto the tokens row. `value` may be null. */
+    async setTokenPriceChange24h(tokenAddress, chain, value) {
+        const address = isSolanaChain(chain) ? String(tokenAddress || '') : String(tokenAddress || '').toLowerCase();
+        let query = supabase.from('tokens').update({ price_changed_24h: value }).eq('token_address', address);
+        if (chain) query = query.eq('chain', chain);
+        const { error } = await query;
+        if (error) throw error;
+    }
+
+    /** Recompute and store a token's 24h price change. Call after each new trade. Never throws. */
+    async refreshPriceChange24h(tokenAddress, chain) {
+        try {
+            const change = await this.getPriceChange24h(tokenAddress, chain);
+            await this.setTokenPriceChange24h(tokenAddress, chain, change);
+        } catch (e) {
+            console.warn(`refreshPriceChange24h failed for ${tokenAddress}:`, e.message);
+        }
     }
 
     async checkPriceDataExists(transactionHash, chain = getEvmChainSlug()) {
@@ -676,6 +757,81 @@ class SupabaseService {
             .maybeSingle();
         if (error) return false;
         return !!data;
+    }
+
+    // ============================================
+    // TOKEN HOLDERS (on-chain balance index)
+    // ============================================
+    /** Active tokens (token + bonding curve + creation block) for the holder indexer. */
+    async getActiveTokensForHolderSync(chain = null) {
+        let q = supabase
+            .from('tokens')
+            .select('token_address, bonding_curve_address, chain, block_number')
+            .eq('status', 'active');
+        if (chain) q = q.eq('chain', chain);
+        const { data, error } = await q;
+        if (error) { console.error('getActiveTokensForHolderSync:', error.message); return []; }
+        return (data || []).map((t) => ({
+            tokenAddress: t.token_address,
+            bondingCurveAddress: t.bonding_curve_address,
+            chain: t.chain || getEvmChainSlug(),
+            blockNumber: Number(t.block_number || 0),
+        }));
+    }
+
+    /** Upsert one holder's raw balance. A zero balance removes the row. */
+    async upsertTokenHolder(chain, tokenAddress, walletAddress, balance) {
+        const tok = normalizeAddress(tokenAddress, chain);
+        const wal = normalizeAddress(walletAddress, chain);
+        const bal = String(balance == null ? '0' : balance);
+        if (bal === '' || /^0+$/.test(bal)) {
+            return this.deleteTokenHolder(chain, tokenAddress, walletAddress);
+        }
+        const { error } = await supabase
+            .from('token_holders')
+            .upsert(
+                { chain, token_address: tok, wallet_address: wal, balance: bal, updated_at: new Date().toISOString() },
+                { onConflict: 'chain,token_address,wallet_address' }
+            );
+        if (error) throw error;
+    }
+
+    async deleteTokenHolder(chain, tokenAddress, walletAddress) {
+        const tok = normalizeAddress(tokenAddress, chain);
+        const wal = normalizeAddress(walletAddress, chain);
+        await supabase.from('token_holders').delete().eq('chain', chain).eq('token_address', tok).eq('wallet_address', wal);
+    }
+
+    async getTokenHolders(chain, tokenAddress, limit = 1000) {
+        const tok = normalizeAddress(tokenAddress, chain);
+        const { data, error } = await supabase
+            .from('token_holders')
+            .select('wallet_address, balance, updated_at')
+            .eq('chain', chain)
+            .eq('token_address', tok)
+            .limit(limit);
+        if (error) { console.error('getTokenHolders:', error.message); return []; }
+        return data || [];
+    }
+
+    /** Replace the full holder set for a token (Solana full scan): upsert current, delete the rest. */
+    async replaceTokenHolders(chain, tokenAddress, holders) {
+        const tok = normalizeAddress(tokenAddress, chain);
+        const keep = new Set();
+        if (holders.length > 0) {
+            const rows = holders.map((h) => {
+                const wal = normalizeAddress(h.wallet, chain);
+                keep.add(wal);
+                return { chain, token_address: tok, wallet_address: wal, balance: String(h.balance), updated_at: new Date().toISOString() };
+            });
+            const { error } = await supabase.from('token_holders').upsert(rows, { onConflict: 'chain,token_address,wallet_address' });
+            if (error) throw error;
+        }
+        const { data: existing } = await supabase.from('token_holders').select('wallet_address').eq('chain', chain).eq('token_address', tok);
+        const stale = (existing || []).map((r) => r.wallet_address).filter((w) => !keep.has(w));
+        if (stale.length > 0) {
+            await supabase.from('token_holders').delete().eq('chain', chain).eq('token_address', tok).in('wallet_address', stale);
+        }
     }
 
     async getTradeHistoryByToken(tokenAddress, limit = 100, chain = null) {
@@ -1294,6 +1450,7 @@ class SupabaseService {
                 username: profileData.username || null,
                 bio: profileData.bio || '',
                 avatar_url: profileData.avatarUrl || '',
+                banner_url: profileData.bannerUrl || '',
                 twitter: profileData.twitter || '',
                 telegram: profileData.telegram || '',
                 website: profileData.website || ''
@@ -1429,6 +1586,7 @@ class SupabaseService {
             username: data.username,
             bio: data.bio,
             avatarUrl: data.avatar_url,
+            bannerUrl: data.banner_url,
             twitter: data.twitter,
             telegram: data.telegram,
             website: data.website,
