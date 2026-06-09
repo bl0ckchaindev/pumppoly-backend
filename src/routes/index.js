@@ -7,6 +7,7 @@ const tokenRoutes = require('./tokenRoutes');
 const traderFeeRoutes = require('./traderFeeRoutes');
 const rewardDistributionRoutes = require('./rewardDistributionRoutes');
 const configRoutes = require('./configRoutes');
+const priceRoutes = require('./priceRoutes');
 
 // Security header for all routes. CORS headers are handled centrally by the cors()
 // middleware in index.js — do NOT set Access-Control-Allow-Origin: '*' here, it would
@@ -22,5 +23,6 @@ router.use(tokenRoutes);
 router.use(traderFeeRoutes);
 router.use(rewardDistributionRoutes);
 router.use(configRoutes);
+router.use(priceRoutes);
 
 module.exports = router;
