@@ -105,7 +105,9 @@ app.use(securityHeaders);
 // development (NODE_ENV !== 'production') any localhost / 127.0.0.1 origin is allowed on any
 // port, so the frontend dev server (e.g. :3000, :5173, :8080) works without config changes.
 const DEFAULT_ALLOWED_ORIGINS = [
-    'https://trollspump.com',
+    'https://pumppoly.com',
+    'https://www.pumppoly.com',
+    'https://app.pumppoly.com',
     'http://localhost:3000',
     'http://localhost:8080'
 ];
