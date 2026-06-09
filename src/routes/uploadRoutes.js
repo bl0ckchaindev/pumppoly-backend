@@ -49,24 +49,38 @@ function sanitizeProfileFilename(name) {
     return safe.startsWith('0x') ? safe.toLowerCase() : safe;
 }
 
-// File upload configuration
+// Base name for token logo/banner files. The frontend sends the token address as the originalname
+// (e.g. "0xabc….png" or a Solana mint), so files are named "<address>-logo.png" / "<address>-banner.png"
+// and never collide across tokens that share a symbol. Strips path separators and the extension;
+// keeps case (Solana base58 mints are case-sensitive; EVM 0x addresses arrive already lowercased).
+function tokenFileBase(originalname) {
+    const safe = String(originalname || '').replace(/[/\\]/g, '').replace(/\.\./g, '').trim();
+    const base = safe.replace(/\.(png|jpe?g|webp|gif)$/i, '');
+    return base || 'token';
+}
+
+// File upload configuration.
+// Logo and banner both live in src/uploads/tokens and are named by token address:
+//   <address>-logo.png   /   <address>-banner.png
+// (the frontend sends the token address as the file's originalname). Naming by address instead of
+// symbol prevents two tokens with the same symbol from overwriting each other's images.
 const logoStorage = multer.diskStorage({
     destination: (req, file, cb) => {
         ensureUploadDir(TOKENS_UPLOAD_DIR);
         cb(null, TOKENS_UPLOAD_DIR);
     },
     filename: (req, file, cb) => {
-        cb(null, file.originalname + "-" + 'logo' + ".png");
+        cb(null, tokenFileBase(file.originalname) + '-logo.png');
     },
 });
 
 const bannerStorage = multer.diskStorage({
     destination: (req, file, cb) => {
-        ensureUploadDir(UPLOADS_BASE);
-        cb(null, UPLOADS_BASE);
+        ensureUploadDir(TOKENS_UPLOAD_DIR);
+        cb(null, TOKENS_UPLOAD_DIR);
     },
     filename: (req, file, cb) => {
-        cb(null, file.originalname + "-" + 'banner' + ".png");
+        cb(null, tokenFileBase(file.originalname) + '-banner.png');
     },
 });
 
