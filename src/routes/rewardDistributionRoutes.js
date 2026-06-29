@@ -1,6 +1,7 @@
 const express = require('express');
 const router = express.Router();
 const rewardDistributionService = require('../services/rewardDistributionService');
+const adminAuth = require('../middleware/adminAuth');
 
 const VALID_CYCLES = ['1min', '5min', '1hour', '1day', '1week'];
 
@@ -23,7 +24,7 @@ router.get('/reward-distribution/config', async (req, res) => {
  * Body: { cycle?: '1min'|'5min'|'1hour'|'1day'|'1week', rewardRatio?: number, nextDistributionAt?: string (ISO), minimumRewardLamports?: number }
  * Updates reward distribution config. All fields optional.
  */
-router.patch('/reward-distribution/config', async (req, res) => {
+router.patch('/reward-distribution/config', adminAuth, async (req, res) => {
     try {
         const { cycle, rewardRatio, nextDistributionAt, minimumRewardLamports } = req.body || {};
         const updates = {};
@@ -66,21 +67,8 @@ router.patch('/reward-distribution/config', async (req, res) => {
     }
 });
 
-/**
- * POST /reward-distribution/run
- * Manually trigger one reward distribution run (for testing or admin).
- */
-router.post('/reward-distribution/run', async (req, res) => {
-    try {
-        const result = await rewardDistributionService.runDistribution();
-        return res.json(result);
-    } catch (error) {
-        console.error('Error running reward distribution:', error.message);
-        if (error.message && error.message.includes('TREASURY_PRIVATE_KEY')) {
-            return res.status(503).json({ error: 'Reward distribution is not configured (treasury not set)' });
-        }
-        return res.status(500).json({ error: error.message || 'Failed to run distribution' });
-    }
-});
+// NOTE: POST /reward-distribution/run (legacy treasury-paid push distribution) was removed.
+// Rewards are claim-only: users withdraw their own rewards and pay their own gas (EVM via the
+// RewardClaim voucher flow; Solana via /claim-trader-fee/solana/build + /confirm).
 
 module.exports = router;

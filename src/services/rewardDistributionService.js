@@ -165,6 +165,12 @@ class RewardDistributionService {
                 }
             }
         } else if (isEvmCompatibleChain(chain)) {
+            // Without the treasury key we can't sign any payout. Skip the whole chain and log ONCE
+            // per epoch instead of failing (and logging) on every trader/creator below.
+            if (!process.env.EVM_TREASURY_PRIVATE_KEY) {
+                console.warn(`[RewardDistribution:${chainLabel}] EVM_TREASURY_PRIVATE_KEY not set — skipping EVM payouts this epoch. Set it to enable trader/creator reward payouts.`);
+                return { ok: false, chain, error: 'EVM_TREASURY_PRIVATE_KEY not set' };
+            }
             try { await evmService.initialize(); } catch (err) {
                 console.error(`[RewardDistribution:${chainLabel}] EVM init failed:`, err.message);
                 return { ok: false, chain, error: `EVM service initialization failed: ${err.message}` };

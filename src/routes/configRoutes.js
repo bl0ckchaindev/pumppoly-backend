@@ -1,6 +1,7 @@
 const express = require('express');
 const router = express.Router();
 const solanaService = require('../services/solanaService');
+const adminAuth = require('../middleware/adminAuth');
 
 /**
  * POST /update-global-config
@@ -13,8 +14,9 @@ const solanaService = require('../services/solanaService');
  *   realSolThreshold: string | number  // lamports (e.g. 65000000000 for 65 SOL)
  * }
  * Updates the Solana program global config (owner-only; uses SOLANA_TREASURY_PRIVATE_KEY).
+ * Protected: requires the admin key (x-admin-key header / Bearer token = ADMIN_API_KEY).
  */
-router.post('/update-global-config', async (req, res) => {
+router.post('/update-global-config', adminAuth, async (req, res) => {
     try {
         const body = req.body || {};
         const protocolFeeBps = body.protocolFeeBps;
@@ -23,6 +25,11 @@ router.post('/update-global-config', async (req, res) => {
         const creatorMigrateFeeBps = body.creatorMigrateFeeBps;
         const protocolMigrateFeeBps = body.protocolMigrateFeeBps;
         const realSolThreshold = body.realSolThreshold;
+        const feeRecipient = body.feeRecipient; // optional: treasury that receives protocol fees (base58)
+
+        if (feeRecipient != null && (typeof feeRecipient !== 'string' || feeRecipient.trim() === '')) {
+            return res.status(400).json({ error: 'feeRecipient must be a base58 wallet address' });
+        }
 
         if (protocolFeeBps === undefined || protocolFeeBps === null) {
             return res.status(400).json({ error: 'protocolFeeBps is required' });
@@ -74,7 +81,8 @@ router.post('/update-global-config', async (req, res) => {
             rewardFeeBps: rewardFeeBpsNum,
             creatorMigrateFeeBps: creatorMigrateFeeBpsNum,
             protocolMigrateFeeBps: protocolMigrateFeeBpsNum,
-            realSolThreshold: realSolThresholdVal
+            realSolThreshold: realSolThresholdVal,
+            feeRecipient
         });
 
         return res.json({

@@ -12,8 +12,10 @@
  *                               This wallet must hold some devnet SOL to pay for the init accounts.
  *
  * All values are overridable via env vars (see DEFAULTS). Trade fees mirror the EVM split
- * (protocol 0.35% / creator 0.45% / reward 0.30% = 1.1%). The graduation threshold defaults
- * to a small, devnet-friendly value so a token can actually migrate to Raydium during testing.
+ * (protocol 0.35% / creator 0.45% / reward 0.30% = 1.1%). The graduation threshold defaults to the
+ * PRODUCTION value (85 SOL). For devnet testing, set REAL_SOL_THRESHOLD_LAMPORTS to a small value
+ * (e.g. 5000000000 = 5 SOL). A mainnet RPC REFUSES a sub-10 SOL threshold (guard below), so a
+ * missing or stale devnet value can never accidentally initialize mainnet at 5 SOL.
  *
  * Usage:
  *   node init-solana-config.js
@@ -29,13 +31,18 @@ const DEFAULTS = {
   rewardFeeBps: 30,                          // 0.30% trader rewards   (total 110 bps = 1.1%)
   creatorMigrateFeeBps: 10,                  // 0.10% at migration
   protocolMigrateFeeBps: 15,                 // 0.15% at migration      (total 25 bps)
-  realSolThresholdLamports: '5000000000',    // 5 SOL graduation threshold (devnet-friendly)
+  realSolThresholdLamports: '85000000000',   // 85 SOL — PRODUCTION graduation threshold
 };
 
 const n = (envName, def) => (process.env[envName] !== undefined ? Number(process.env[envName]) : def);
 
 async function main() {
   const params = {
+    // fee_recipient = treasury that RECEIVES protocol fees. Set FEE_RECIPIENT to the final fee
+    // wallet; if omitted it defaults to the signer (owner). owner + migrator are set to the SIGNER
+    // (SOLANA_TREASURY_PRIVATE_KEY) by initialize_config — sign with the owner wallet, then run
+    // set-solana-roles.js to point the migrator at its own wallet.
+    feeRecipient: process.env.FEE_RECIPIENT || undefined,
     protocolFeeBps: n('PROTOCOL_FEE_BPS', DEFAULTS.protocolFeeBps),
     creatorFeeBps: n('CREATOR_FEE_BPS', DEFAULTS.creatorFeeBps),
     rewardFeeBps: n('REWARD_FEE_BPS', DEFAULTS.rewardFeeBps),
@@ -49,6 +56,7 @@ async function main() {
 
   console.log('Initializing Solana global config');
   console.log('  RPC                          :', process.env.SOLANA_RPC_URL || '(SOLANA_RPC_URL not set!)');
+  console.log('  fee_recipient                :', params.feeRecipient || '(defaults to owner/signer)');
   console.log('  protocol/creator/reward bps  :', params.protocolFeeBps, '/', params.creatorFeeBps, '/', params.rewardFeeBps, `(total ${totalTrade}, max 200)`);
   console.log('  migrate creator/protocol bps :', params.creatorMigrateFeeBps, '/', params.protocolMigrateFeeBps, `(total ${totalMigrate}, max 500)`);
   console.log('  real SOL threshold (lamports):', params.realSolThreshold, `(${Number(params.realSolThreshold) / 1e9} SOL)`);
@@ -59,6 +67,20 @@ async function main() {
   if (totalTrade > 200) throw new Error(`trade fee total ${totalTrade} bps exceeds on-chain max of 200`);
   if (totalMigrate > 500) throw new Error(`migrate fee total ${totalMigrate} bps exceeds on-chain max of 500`);
   if (!/^\d+$/.test(params.realSolThreshold)) throw new Error('REAL_SOL_THRESHOLD_LAMPORTS must be a non-negative integer (lamports)');
+
+  // Mainnet safety: never let a missing/stale devnet threshold initialize a real mainnet config.
+  const rpc = (process.env.SOLANA_RPC_URL || '').toLowerCase();
+  const isMainnet = rpc.includes('mainnet') && !rpc.includes('devnet') && !rpc.includes('testnet');
+  const MAINNET_MIN_LAMPORTS = 10_000_000_000n; // 10 SOL floor — blocks obvious test values (e.g. 5 SOL)
+  if (isMainnet) {
+    console.log('  network                      : MAINNET (detected from SOLANA_RPC_URL)');
+    if (BigInt(params.realSolThreshold) < MAINNET_MIN_LAMPORTS) {
+      throw new Error(
+        `Refusing to initialize a MAINNET config with a ${Number(params.realSolThreshold) / 1e9} SOL graduation ` +
+        `threshold. Set REAL_SOL_THRESHOLD_LAMPORTS explicitly (production = 85 SOL = 85000000000).`
+      );
+    }
+  }
 
   try {
     const sig = await solanaService.initializeConfig(params);

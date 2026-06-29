@@ -972,6 +972,82 @@ class SupabaseService {
         return (data || []).map(row => this.transformTraderFee(row));
     }
 
+    /**
+     * All-time cumulative reward_fee for a wallet on a chain, as a stringified BigInt (wei on EVM).
+     * This is the source of truth for the signed-voucher claim: the wallet is entitled to claim back
+     * the reward fees its own trades generated, and the on-chain RewardClaim contract tracks how much
+     * has already been withdrawn. (No 'claimed' filter — the contract, not the DB, records claims.)
+     */
+    async getCumulativeRewardFeeByWallet(walletAddress, chain) {
+        const wallet = String(walletAddress || '').trim();
+        if (!wallet) return '0';
+        let query = supabase.from('trader_fees').select('reward_fee').eq('wallet_address', wallet);
+        if (chain) query = query.eq('chain', chain);
+        const { data, error } = await query;
+        if (error) { console.error('getCumulativeRewardFeeByWallet:', error.message); return '0'; }
+        let total = 0n;
+        for (const row of (data || [])) {
+            try { total += BigInt(row.reward_fee || '0'); } catch { /* skip malformed */ }
+        }
+        return total.toString();
+    }
+
+    // ── reward_claims: per-wallet cumulative claimed + in-flight lock (restart-safe) ─────────────
+    /** The reward_claims row for (chain, wallet), or null. */
+    async getRewardClaimRecord(chain, wallet) {
+        const { data, error } = await supabase
+            .from('reward_claims')
+            .select('*')
+            .eq('chain', chain)
+            .eq('wallet', wallet)
+            .maybeSingle();
+        if (error) { console.error('getRewardClaimRecord:', error.message); return null; }
+        return data || null;
+    }
+
+    /** Open an in-flight claim lock (overwrites any prior pending; preserves claimed_amount). */
+    async setPendingClaim(chain, wallet, amount, expiresAtIso) {
+        const { error } = await supabase
+            .from('reward_claims')
+            .upsert(
+                { chain, wallet, pending_amount: String(amount), pending_signature: null, pending_expires_at: expiresAtIso, updated_at: new Date().toISOString() },
+                { onConflict: 'chain,wallet' }
+            );
+        if (error) throw new Error('setPendingClaim: ' + error.message);
+    }
+
+    /** Record the submitted tx signature on the in-flight lock (so reconcile can verify it). */
+    async attachPendingSignature(chain, wallet, signature) {
+        const { error } = await supabase
+            .from('reward_claims')
+            .update({ pending_signature: signature, updated_at: new Date().toISOString() })
+            .eq('chain', chain).eq('wallet', wallet);
+        if (error) throw new Error('attachPendingSignature: ' + error.message);
+    }
+
+    /** Add `addAmount` to cumulative claimed and clear the in-flight lock. Returns new cumulative. */
+    async finalizeClaim(chain, wallet, addAmount) {
+        const rec = await this.getRewardClaimRecord(chain, wallet);
+        const next = (BigInt((rec && rec.claimed_amount) || '0') + BigInt(String(addAmount))).toString();
+        const { error } = await supabase
+            .from('reward_claims')
+            .upsert(
+                { chain, wallet, claimed_amount: next, pending_amount: null, pending_signature: null, pending_expires_at: null, updated_at: new Date().toISOString() },
+                { onConflict: 'chain,wallet' }
+            );
+        if (error) throw new Error('finalizeClaim: ' + error.message);
+        return next;
+    }
+
+    /** Drop the in-flight lock without changing claimed_amount (expired / failed claim). */
+    async clearPendingClaim(chain, wallet) {
+        const { error } = await supabase
+            .from('reward_claims')
+            .update({ pending_amount: null, pending_signature: null, pending_expires_at: null, updated_at: new Date().toISOString() })
+            .eq('chain', chain).eq('wallet', wallet);
+        if (error) console.error('clearPendingClaim:', error.message);
+    }
+
     async markTraderFeesAsClaimed(ids, claimTxSignature = null) {
         if (!ids || !Array.isArray(ids) || ids.length === 0) return;
         const { error } = await supabase

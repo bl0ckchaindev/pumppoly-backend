@@ -59,30 +59,69 @@ function tokenFileBase(originalname) {
     return base || 'token';
 }
 
-// File upload configuration.
-// Logo and banner both live in src/uploads/tokens and are named by token address:
-//   <address>-logo.png   /   <address>-banner.png
-// (the frontend sends the token address as the file's originalname). Naming by address instead of
-// symbol prevents two tokens with the same symbol from overwriting each other's images.
-const logoStorage = multer.diskStorage({
-    destination: (req, file, cb) => {
-        ensureUploadDir(TOKENS_UPLOAD_DIR);
-        cb(null, TOKENS_UPLOAD_DIR);
-    },
-    filename: (req, file, cb) => {
-        cb(null, tokenFileBase(file.originalname) + '-logo.png');
-    },
-});
+// ── Token logo/banner upload security ────────────────────────────────────────────────────────────
+// Logo and banner are validated server-side (type + size) and stored in src/uploads/tokens, named
+// by token address: <address>-logo.png / <address>-banner.png (the frontend sends the token address
+// as the file's originalname). Naming by address prevents two tokens with the same symbol from
+// overwriting each other's images.
+const LOGO_MAX_BYTES = 1 * 1024 * 1024;   // 1 MB
+const BANNER_MAX_BYTES = 3 * 1024 * 1024; // 3 MB
+const ALLOWED_IMAGE_MIMES = ['image/png', 'image/jpeg', 'image/jpg', 'image/webp'];
 
-const bannerStorage = multer.diskStorage({
-    destination: (req, file, cb) => {
+// Soft check on the client-declared mime (rejects SVG/GIF/non-images early). The authoritative check
+// is detectImageType() on the actual bytes below — the client mime/extension is never trusted.
+function imageMimeFilter(req, file, cb) {
+    if (ALLOWED_IMAGE_MIMES.includes(String(file.mimetype || '').toLowerCase())) return cb(null, true);
+    req.fileValidationError = 'Only PNG, JPG, JPEG, or WEBP images are allowed (no SVG or GIF).';
+    return cb(null, false);
+}
+
+// Authoritative content-type check by magic bytes. Returns 'png' | 'jpeg' | 'webp', or null for
+// anything else — GIF, SVG, and non-image files are rejected.
+function detectImageType(buf) {
+    if (!buf || buf.length < 12) return null;
+    if (buf[0] === 0x89 && buf[1] === 0x50 && buf[2] === 0x4e && buf[3] === 0x47) return 'png';   // \x89PNG
+    if (buf[0] === 0xff && buf[1] === 0xd8 && buf[2] === 0xff) return 'jpeg';                      // JPEG SOI
+    if (buf[0] === 0x52 && buf[1] === 0x49 && buf[2] === 0x46 && buf[3] === 0x46 &&                // "RIFF"
+        buf[8] === 0x57 && buf[9] === 0x45 && buf[10] === 0x42 && buf[11] === 0x50) return 'webp'; // "WEBP"
+    return null;
+}
+
+// Run a multer middleware and turn its errors (e.g. file-too-large) into clean 4xx JSON.
+function runUpload(mw) {
+    return (req, res, next) => {
+        mw(req, res, (err) => {
+            if (err) {
+                if (err.code === 'LIMIT_FILE_SIZE') return res.status(413).json({ message: 'File too large' });
+                return res.status(400).json({ message: err.message || 'Upload failed' });
+            }
+            next();
+        });
+    };
+}
+
+// Validate the in-memory upload (mime filter already ran; verify magic bytes + size) and persist it
+// as <address>-<kind>.png. Rejects non-image / SVG / GIF payloads even if the client faked the mime.
+function makeImageHandler(kind, maxBytes) {
+    return (req, res) => {
+        if (req.fileValidationError) return res.status(400).json({ message: req.fileValidationError });
+        if (!req.file || !req.file.buffer) return res.status(400).json({ message: 'No file was uploaded.' });
+        if (req.file.size > maxBytes) return res.status(413).json({ message: 'File too large' });
+        const type = detectImageType(req.file.buffer);
+        if (!type) return res.status(400).json({ message: 'Invalid or unsupported image. Allowed: PNG, JPG, JPEG, WEBP.' });
         ensureUploadDir(TOKENS_UPLOAD_DIR);
-        cb(null, TOKENS_UPLOAD_DIR);
-    },
-    filename: (req, file, cb) => {
-        cb(null, tokenFileBase(file.originalname) + '-banner.png');
-    },
-});
+        const filename = tokenFileBase(req.file.originalname) + '-' + kind + '.png';
+        try {
+            fs.writeFileSync(path.join(TOKENS_UPLOAD_DIR, filename), req.file.buffer);
+        } catch (e) {
+            console.error('Failed to write upload:', e.message);
+            return res.status(500).json({ message: 'Failed to save file' });
+        }
+        return res.status(200).json({
+            fileInfo: { filename, originalname: req.file.originalname, mimetype: 'image/' + type, size: req.file.size }
+        });
+    };
+}
 
 const profileStorage = multer.diskStorage({
     destination: (req, file, cb) => {
@@ -96,8 +135,8 @@ const profileStorage = multer.diskStorage({
     },
 });
 
-const logoUpload = multer({ storage: logoStorage });
-const bannerUpload = multer({ storage: bannerStorage });
+const logoUpload = multer({ storage: multer.memoryStorage(), fileFilter: imageMimeFilter, limits: { fileSize: LOGO_MAX_BYTES } });
+const bannerUpload = multer({ storage: multer.memoryStorage(), fileFilter: imageMimeFilter, limits: { fileSize: BANNER_MAX_BYTES } });
 const profileUpload = multer({
     storage: profileStorage,
     fileFilter: (req, file, cb) => {
@@ -146,21 +185,9 @@ const commentImageUpload = multer({
 // Upload routes with rate limiting
 // Note: Specific routes (profile, comments) must be defined before generic route
 
-router.post('/uploads/logo', uploadLimiter, logoUpload.single('file'), (req, res) => {
-    if (req.file) {
-        return res.status(200).json({ fileInfo: req.file });
-    } else {
-        res.status(400).json({ message: 'No file was uploaded.' });
-    }
-});
+router.post('/uploads/logo', uploadLimiter, runUpload(logoUpload.single('file')), makeImageHandler('logo', LOGO_MAX_BYTES));
 
-router.post('/uploads/banner', uploadLimiter, bannerUpload.single('file'), (req, res) => {
-    if (req.file) {
-        return res.status(200).json({ fileInfo: req.file });
-    } else {
-        res.status(400).json({ message: 'No file was uploaded.' });
-    }
-});
+router.post('/uploads/banner', uploadLimiter, runUpload(bannerUpload.single('file')), makeImageHandler('banner', BANNER_MAX_BYTES));
 
 router.post('/uploads/profile', uploadLimiter, profileUpload.single('file'), (req, res) => {
     if (req.fileValidationError) {
@@ -310,21 +337,9 @@ router.get('/uploads/:name', (req, res) => {
 });
 
 // Legacy upload routes (for backward compatibility with frontend)
-router.post('/logoUploads', uploadLimiter, logoUpload.single('file'), (req, res) => {
-    if (req.file) {
-        return res.status(200).json({ fileInfo: req.file });
-    } else {
-        res.status(400).json({ message: 'No file was uploaded.' });
-    }
-});
+router.post('/logoUploads', uploadLimiter, runUpload(logoUpload.single('file')), makeImageHandler('logo', LOGO_MAX_BYTES));
 
-router.post('/bannerUploads', uploadLimiter, bannerUpload.single('file'), (req, res) => {
-    if (req.file) {
-        return res.status(200).json({ fileInfo: req.file });
-    } else {
-        res.status(400).json({ message: 'No file was uploaded.' });
-    }
-});
+router.post('/bannerUploads', uploadLimiter, runUpload(bannerUpload.single('file')), makeImageHandler('banner', BANNER_MAX_BYTES));
 
 router.post('/profileUploads', uploadLimiter, profileUpload.single('file'), (req, res) => {
     if (req.file) {

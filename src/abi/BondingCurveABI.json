@@ -354,6 +354,24 @@
     "type": "function"
   },
   {
+    "inputs": [
+      {
+        "internalType": "uint256",
+        "name": "minTokensOut",
+        "type": "uint256"
+      },
+      {
+        "internalType": "address",
+        "name": "recipient",
+        "type": "address"
+      }
+    ],
+    "name": "buyTokenFor",
+    "outputs": [],
+    "stateMutability": "payable",
+    "type": "function"
+  },
+  {
     "inputs": [],
     "name": "claimFees",
     "outputs": [],
@@ -691,24 +709,6 @@
       }
     ],
     "name": "sellToken",
-    "outputs": [],
-    "stateMutability": "nonpayable",
-    "type": "function"
-  },
-  {
-    "inputs": [
-      {
-        "internalType": "address",
-        "name": "_factory",
-        "type": "address"
-      },
-      {
-        "internalType": "address",
-        "name": "_WETH",
-        "type": "address"
-      }
-    ],
-    "name": "setUniswapV3Addresses",
     "outputs": [],
     "stateMutability": "nonpayable",
     "type": "function"

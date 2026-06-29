@@ -441,17 +441,21 @@ class SolanaService {
             feeAuthority,
             true
         );
-        const ownerQuoteAccount = getAssociatedTokenAddressSync(
-            NATIVE_MINT,
-            this.treasuryKeypair.publicKey,
-            false
-        );
+        // Protocol fees now go to the config's fee_recipient (separate from the owner/admin). Read it
+        // from the on-chain config and derive its WSOL ATA (the instruction creates it on demand).
+        const cfg = await this.program.account.globalConfig.fetch(globalConfig);
+        const feeRecipient = cfg.feeRecipient;
+        if (!feeRecipient) {
+            throw new Error('Global config has no fee_recipient — deploy the updated program and refresh the IDL');
+        }
+        const recipientQuoteAccount = getAssociatedTokenAddressSync(NATIVE_MINT, feeRecipient, false);
         const tx = await this.program.methods
             .claimProtocolFee()
             .accountsStrict({
                 owner: this.treasuryKeypair.publicKey,
-                ownerQuoteAccount,
                 globalConfig,
+                feeRecipient,
+                recipientQuoteAccount,
                 feeAuthority,
                 feeQuoteAccount,
                 quoteMint: NATIVE_MINT,
@@ -521,6 +525,9 @@ class SolanaService {
             throw new Error('SOLANA_TREASURY_PRIVATE_KEY is not set; cannot initialize global config');
         }
         const owner = this.treasuryKeypair.publicKey;
+        // fee_recipient: treasury that RECEIVES protocol fees (separate from the owner/admin).
+        // Defaults to the owner if not supplied.
+        const feeRecipient = params.feeRecipient ? new PublicKey(params.feeRecipient) : owner;
         const globalConfig = this.getGlobalConfigPDA();
         const feeAuthority = this.getFeeAuthorityPDA();
         // ATA owned by the fee_authority PDA (allowOwnerOffCurve = true)
@@ -530,6 +537,7 @@ class SolanaService {
             throw new Error('realSolThreshold must be non-negative (lamports)');
         }
         const args = {
+            feeRecipient,
             protocolFeeBps: Number(params.protocolFeeBps ?? 0),
             creatorFeeBps: Number(params.creatorFeeBps ?? 0),
             rewardFeeBps: Number(params.rewardFeeBps ?? 0),
@@ -577,26 +585,34 @@ class SolanaService {
         if (!this.treasuryKeypair) {
             throw new Error('SOLANA_TREASURY_PRIVATE_KEY is not set; cannot update global config');
         }
-        const owner = this.treasuryKeypair.publicKey;
+        const signer = this.treasuryKeypair.publicKey; // must be the CURRENT config owner
         const globalConfig = this.getGlobalConfigPDA();
+        // Preserve the existing owner / migrator / fee_recipient unless explicitly overridden, so a
+        // routine fee/threshold update never clobbers a handed-over role. (update_config writes all
+        // three every call.) Pass owner/migrator/feeRecipient to perform the one-time role handover.
+        const cfg = await this.program.account.globalConfig.fetch(globalConfig);
+        const newOwner = params.owner ? new PublicKey(params.owner) : cfg.owner;
+        const migrator = params.migrator ? new PublicKey(params.migrator) : cfg.migrator;
+        const feeRecipient = params.feeRecipient ? new PublicKey(params.feeRecipient) : cfg.feeRecipient;
         const realSolThreshold = new BN(String(params.realSolThreshold ?? '0'));
         if (realSolThreshold.lt(0)) {
             throw new Error('realSolThreshold must be non-negative (lamports)');
         }
         const args = {
-            owner,
+            owner: newOwner,
+            feeRecipient,
             protocolFeeBps: Number(params.protocolFeeBps ?? 0),
             creatorFeeBps: Number(params.creatorFeeBps ?? 0),
             rewardFeeBps: Number(params.rewardFeeBps ?? 0),
             creatorMigrateFeeBps: Number(params.creatorMigrateFeeBps ?? 0),
             protocolMigrateFeeBps: Number(params.protocolMigrateFeeBps ?? 0),
-            migrator: owner,
+            migrator,
             realSolThreshold
         };
         const tx = await this.program.methods
             .updateConfig(args)
             .accounts({
-                owner,
+                owner: signer,
                 globalConfig
             })
             .signers([this.treasuryKeypair])
@@ -641,6 +657,89 @@ class SolanaService {
             { commitment: 'confirmed', skipPreflight: false }
         );
         return sig;
+    }
+
+    /**
+     * Build a reward-payout transfer that the USER pays gas for: treasury → user, with the user set
+     * as fee payer. The treasury partial-signs (authorizing the funds); the user co-signs (as fee
+     * payer) and submits, so the platform pays no network fee. Returns a base64 partially-signed tx.
+     */
+    async buildTraderFeeClaimTx(toAddress, lamports) {
+        await this.initialize();
+        if (!this.treasuryKeypair) {
+            throw new Error('SOLANA_TREASURY_PRIVATE_KEY is not set; cannot build claim transaction');
+        }
+        const toPubkey = new PublicKey(toAddress);
+        const amount = typeof lamports === 'bigint' ? lamports : BigInt(String(lamports));
+        if (amount <= 0n) throw new Error('Claim amount must be positive');
+
+        const tx = new Transaction().add(
+            SystemProgram.transfer({
+                fromPubkey: this.treasuryKeypair.publicKey,
+                toPubkey,
+                lamports: Number(amount)
+            })
+        );
+        const { blockhash, lastValidBlockHeight } = await this.connection.getLatestBlockhash('confirmed');
+        tx.recentBlockhash = blockhash;
+        tx.feePayer = toPubkey;                  // user pays the network fee
+        tx.partialSign(this.treasuryKeypair);     // treasury authorizes the transfer (no fee, not fee payer)
+
+        const serialized = tx.serialize({ requireAllSignatures: false, verifySignatures: false }).toString('base64');
+        return { transaction: serialized, blockhash, lastValidBlockHeight, amount: amount.toString() };
+    }
+
+    /**
+     * Verify a confirmed transaction `signature` is exactly the treasury → `toAddress` System
+     * transfer of `lamports` (the expected reward payout). Returns false if the tx isn't confirmed
+     * yet, errored, or doesn't match — so a claim can't be finalized with an unrelated signature.
+     */
+    async verifyClaimPayout(signature, toAddress, lamports) {
+        await this.initialize();
+        if (!this.treasuryKeypair) return false;
+        const tx = await this.connection.getParsedTransaction(signature, {
+            commitment: 'confirmed',
+            maxSupportedTransactionVersion: 0,
+        });
+        if (!tx || (tx.meta && tx.meta.err)) return false;
+        const treasuryStr = this.treasuryKeypair.publicKey.toBase58();
+        const toStr = new PublicKey(toAddress).toBase58();
+        const target = BigInt(String(lamports));
+        const instructions = (tx.transaction && tx.transaction.message && tx.transaction.message.instructions) || [];
+        for (const ix of instructions) {
+            const p = ix.parsed;
+            if (p && p.type === 'transfer' && ix.program === 'system' && p.info) {
+                if (
+                    p.info.source === treasuryStr &&
+                    p.info.destination === toStr &&
+                    BigInt(String(p.info.lamports)) === target
+                ) {
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
+
+    /**
+     * Reconciliation helper: find a confirmed treasury → `toAddress` transfer of `lamports` that
+     * landed at/after `sinceUnixSeconds`. Detects a payout the user never reported (built + submitted
+     * the claim tx but skipped /confirm) so an expired lock is never released for a claim that already
+     * paid out (double-claim protection). Returns the matching signature, or null.
+     */
+    async findTreasuryPayout(toAddress, lamports, sinceUnixSeconds) {
+        await this.initialize();
+        if (!this.treasuryKeypair) return null;
+        const treasury = this.treasuryKeypair.publicKey;
+        const sigs = await this.connection.getSignaturesForAddress(treasury, { limit: 200 });
+        for (const s of sigs) {
+            if (s.err) continue;
+            // List is newest-first; stop once we pass below the window (small skew margin).
+            if (sinceUnixSeconds && s.blockTime && s.blockTime < sinceUnixSeconds - 10) break;
+            const ok = await this.verifyClaimPayout(s.signature, toAddress, lamports).catch(() => false);
+            if (ok) return s.signature;
+        }
+        return null;
     }
 }
 

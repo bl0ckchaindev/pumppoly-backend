@@ -67,20 +67,11 @@ class CronService {
         healthCheckJob.start();
         console.log('✓ Cron job started: Health check every hour');
 
-        // Reward distribution: check every minute; run distribution when next_distribution_at is due
-        const rewardDistributionService = require('./rewardDistributionService');
-        const rewardDistributionJob = cron.schedule('* * * * *', async () => {
-            try {
-                await rewardDistributionService.checkAndRun();
-            } catch (error) {
-                console.error('[Cron] Reward distribution check error:', error.message);
-            }
-        }, {
-            scheduled: false
-        });
-        this.jobs.push({ name: 'rewardDistribution', job: rewardDistributionJob });
-        rewardDistributionJob.start();
-        console.log('✓ Cron job started: Reward distribution (check every 1 min)');
+        // Reward distribution is now CLAIM-ONLY: rewards accumulate per wallet in the DB and are
+        // paid out only when the user presses Claim (user pays the claim gas via the on-chain claim
+        // mechanism). The automatic push-distribution scheduler is intentionally disabled so the
+        // platform never auto-pays rewards with its own gas. (Re-enable by restoring this cron.)
+        console.log('ℹ Reward auto-distribution disabled — rewards are claim-only.');
 
         // Holder indexer: refresh on-chain holder balances for active tokens every 2 minutes.
         const holderSyncJob = cron.schedule('*/2 * * * *', async () => {

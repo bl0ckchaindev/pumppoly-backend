@@ -27,8 +27,8 @@ function verifySolanaSignature(message, signatureB64, publicKeyB58) {
   }
 }
 const { getEventListener } = require('../eventListener');
-const { virtualEthLpInitial, virtualTokenLpInitial, realEthLpInitial, realTokenLpInitial, bondingLimit } = require('../config');
-const { chainIdToSlug, CHAIN_ID_TO_SLUG } = require('../lib/chainUtils');
+const { virtualEthLpInitial, virtualTokenLpInitial, realEthLpInitial, realTokenLpInitial, bondingLimit, netId } = require('../config');
+const { chainIdToSlug, CHAIN_ID_TO_SLUG, getEvmChainSlug } = require('../lib/chainUtils');
 
 const SUPPORTED_EVM_CHAIN_IDS = new Set(Object.keys(CHAIN_ID_TO_SLUG).map(Number));
 
@@ -94,23 +94,73 @@ router.post('/tokens/register', async (req, res) => {
       return res.status(400).json({ success: false, error: 'symbol is required' });
     }
 
+    // ── Verify the on-chain factory event (not just the tx-hash format) ──────────────────────────
+    // Confirm the transaction exists, succeeded, and emitted a matching TokenCreated event from THIS
+    // backend's factory, so callers can't register spoofed/fake tokens. On-chain values are
+    // authoritative. (If this is rejected, the event listener still indexes real tokens on its own.)
+    if (chainIdNum !== netId) {
+      return res.status(400).json({
+        success: false,
+        error: `chainId ${chainIdNum} does not match this indexer's chain (${netId}); cannot verify on-chain`
+      });
+    }
+
+    let evt;
+    let verifiedBlock = 0;
+    try {
+      const listener = getEventListener();
+      if (!listener.provider || !listener.factoryContract) await listener.initialize();
+
+      const receipt = await listener.provider.getTransactionReceipt(transactionHash);
+      if (!receipt) {
+        return res.status(400).json({ success: false, error: 'Transaction not found or not yet mined; retry shortly' });
+      }
+      if (receipt.status !== 1) {
+        return res.status(400).json({ success: false, error: 'Transaction failed on-chain' });
+      }
+
+      const factoryAddr = String(listener.factoryContract.address || listener.factoryAddress || '').toLowerCase();
+      for (const log of (receipt.logs || [])) {
+        if (String(log.address).toLowerCase() !== factoryAddr) continue;
+        let parsed;
+        try { parsed = listener.factoryContract.interface.parseLog(log); } catch (_) { continue; }
+        if (parsed && parsed.name === 'TokenCreated') { evt = parsed; break; }
+      }
+      if (!evt) {
+        return res.status(400).json({ success: false, error: 'No matching TokenCreated event from the factory in this transaction' });
+      }
+      verifiedBlock = Number(receipt.blockNumber) || 0;
+    } catch (e) {
+      console.error('POST /tokens/register on-chain verification error:', e.message);
+      return res.status(502).json({ success: false, error: 'Failed to verify the transaction on-chain; retry shortly' });
+    }
+
+    // On-chain values are the source of truth; reject if the request contradicts them.
+    const evToken = String(evt.args.tokenAddress).toLowerCase();
+    const evCurve = String(evt.args.bondingCurveAddress).toLowerCase();
+    const evCreator = String(evt.args.creator).toLowerCase();
+    if (
+      evToken !== tokenAddress.toLowerCase() ||
+      evCurve !== bondingCurveAddress.toLowerCase() ||
+      evCreator !== creator.toLowerCase()
+    ) {
+      return res.status(400).json({
+        success: false,
+        error: 'Request does not match the on-chain TokenCreated event (token/bondingCurve/creator mismatch)'
+      });
+    }
+
     const virtualEthLp = virtualEthLpInitial || '10000000000000000';
     const virtualTokenLp = virtualTokenLpInitial || '1073000000000000000000000';
     const realEthLp = realEthLpInitial || '0';
     const realTokenLp = realTokenLpInitial || '200000000000000000000000000';
     const k = (BigInt(virtualEthLp) * BigInt(virtualTokenLp)).toString();
-    let blockNum = blockNumber != null ? Number(blockNumber) : 0;
-    // Frontend registrations usually omit the block number. Backfill it from the tx receipt so
-    // downstream block-range scans (holder indexer, catch-up) don't start from genesis.
-    if (!blockNum && transactionHash) {
-      try {
-        const listener = getEventListener();
-        if (!listener.provider) await listener.initialize();
-        const receipt = await listener.provider.getTransactionReceipt(transactionHash);
-        if (receipt && receipt.blockNumber) blockNum = Number(receipt.blockNumber);
-      } catch (e) { /* keep 0; holder indexer floors at FACTORY_DEPLOY_BLOCK */ }
-    }
-    const ts = timestamp != null ? Number(timestamp) : Math.floor(Date.now() / 1000);
+    // Block number + timestamp come from the verified receipt/event (authoritative), with the
+    // request body only as a fallback.
+    const blockNum = verifiedBlock || (blockNumber != null ? Number(blockNumber) : 0);
+    const ts = evt.args.timestamp
+      ? Number(evt.args.timestamp.toString())
+      : (timestamp != null ? Number(timestamp) : Math.floor(Date.now() / 1000));
 
     const chainSlug =
       typeof chainBody === 'string' && chainBody.trim()
@@ -119,15 +169,15 @@ router.post('/tokens/register', async (req, res) => {
 
     const tokenData = {
       chain: chainSlug,
-      tokenAddress: tokenAddress.toLowerCase(),
-      bondingCurveAddress: bondingCurveAddress.toLowerCase(),
-      creator: creator.toLowerCase(),
-      name: String(name || '').trim(),
-      symbol: String(symbol || '').trim(),
-      description: String(description || ''),
-      website: String(website || ''),
-      twitter: String(twitter || ''),
-      telegram: String(telegram || ''),
+      tokenAddress: evToken,
+      bondingCurveAddress: evCurve,
+      creator: evCreator,
+      name: String(evt.args.name ?? name ?? '').trim(),
+      symbol: String(evt.args.symbol ?? symbol ?? '').trim(),
+      description: String(evt.args.description ?? description ?? ''),
+      website: String(evt.args.website ?? website ?? ''),
+      twitter: String(evt.args.twitter ?? twitter ?? ''),
+      telegram: String(evt.args.telegram ?? telegram ?? ''),
       discord: '',
       logoUrl: String(logoUrl || ''),
       bannerUrl: String(bannerUrl || ''),
@@ -243,6 +293,17 @@ router.post('/tokens/process-trade', async (req, res) => {
       });
     }
 
+    // Only process trades for a bonding curve we've indexed (created by the PumpPoly factory).
+    // bonding_curves rows are only inserted from verified TokenCreated factory events, so existence
+    // here is proof of factory origin — this blocks trade/fee events from arbitrary contracts.
+    const tradeCurve = await supabaseService.getBondingCurveByAddress(bondingCurveAddress.toLowerCase(), getEvmChainSlug());
+    if (!tradeCurve) {
+      return res.status(400).json({
+        success: false,
+        error: 'Unknown bondingCurveAddress — not a registered PumpPoly bonding curve'
+      });
+    }
+
     const listener = getEventListener();
     const result = await listener.processTradeFromTxHash(transactionHash, bondingCurveAddress);
 
@@ -279,6 +340,16 @@ router.post('/tokens/ensure-listening', async (req, res) => {
       return res.status(400).json({
         success: false,
         error: 'Valid bondingCurveAddress is required'
+      });
+    }
+
+    // Only subscribe to a bonding curve we've indexed (created by the PumpPoly factory) — never an
+    // arbitrary contract address.
+    const listenCurve = await supabaseService.getBondingCurveByAddress(bondingCurveAddress.toLowerCase(), getEvmChainSlug());
+    if (!listenCurve) {
+      return res.status(400).json({
+        success: false,
+        error: 'Unknown bondingCurveAddress — not a registered PumpPoly bonding curve'
       });
     }
 

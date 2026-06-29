@@ -12,7 +12,7 @@ const REAL_TOKEN_LP_INITIAL = process.env.REAL_TOKEN_LP_INITIAL || '100000000000
 const BONDING_LIMIT = process.env.BONDING_LIMIT || '200000000000000000'; // Value in wei - when real_eth_lp >= this, lp_created = true
 
 module.exports = {
-    netId: Number(process.env.NET_ID) || 137,
+    netId: Number(process.env.NET_ID) || 8453, // default to Base mainnet (set NET_ID for other chains)
     httpRpcUrl: process.env.HTTP_RPC_URL,
     wsRpcUrl: process.env.WS_RPC_URL,
     oracleRpcUrl: process.env.ORACLE_RPC_URL,
