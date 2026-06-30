@@ -2,17 +2,17 @@
 
 /**
  * Manual catch-up script to process missed events
- * Usage: node manual-catchup.js <bondingCurveAddress> <startBlock> <endBlock>
- * Example: node manual-catchup.js 0x0a46c475f22c5a661675031ed651457492178533 10040992 10057000
+ * Usage: node scripts/manual-catchup.js <bondingCurveAddress> <startBlock> <endBlock>
+ * Example: node scripts/manual-catchup.js 0x0a46c475f22c5a661675031ed651457492178533 10040992 10057000
  */
 
-require('dotenv').config();
+require('dotenv').config({ path: require('path').join(__dirname, '..', '.env') });
 const ethers = require('ethers');
-const { httpRpcUrl } = require('./src/config');
-const BONDING_CURVE_ABI = require('./src/abi/BondingCurveABI.json');
-const supabaseService = require('./src/services/supabaseService');
-const tokenService = require('./src/services/tokenService');
-const blockPersistence = require('./src/services/blockPersistence');
+const { httpRpcUrl } = require('../src/config');
+const BONDING_CURVE_ABI = require('../src/abi/BondingCurveABI.json');
+const supabaseService = require('../src/services/supabaseService');
+const tokenService = require('../src/services/tokenService');
+const blockPersistence = require('../src/services/blockPersistence');
 
 async function manualCatchUp(bondingCurveAddress, startBlock, endBlock) {
     try {
@@ -68,7 +68,7 @@ async function manualCatchUp(bondingCurveAddress, startBlock, endBlock) {
                         }
                         
                         // Use the same event handler as the main listener
-                        const { getEventListener } = require('./src/eventListener');
+                        const { getEventListener } = require('../src/eventListener');
                         const listener = getEventListener();
                         
                         // Create a mock event object with the necessary properties
@@ -129,8 +129,8 @@ async function manualCatchUp(bondingCurveAddress, startBlock, endBlock) {
 // Parse command line arguments
 const args = process.argv.slice(2);
 if (args.length < 3) {
-    console.error('Usage: node manual-catchup.js <bondingCurveAddress> <startBlock> <endBlock>');
-    console.error('Example: node manual-catchup.js 0x0a46c475f22c5a661675031ed651457492178533 10040992 10057000');
+    console.error('Usage: node scripts/manual-catchup.js <bondingCurveAddress> <startBlock> <endBlock>');
+    console.error('Example: node scripts/manual-catchup.js 0x0a46c475f22c5a661675031ed651457492178533 10040992 10057000');
     process.exit(1);
 }
 

@@ -19,8 +19,8 @@
  *   SOLANA_FEE_RECIPIENT   fee receiver wallet (receives protocol fees)
  *   (optional fee/threshold overrides, else production defaults below)
  */
-require('dotenv').config();
-const solanaService = require('./src/services/solanaService');
+require('dotenv').config({ path: require('path').join(__dirname, '..', '.env') });
+const solanaService = require('../src/services/solanaService');
 
 const DEFAULTS = {
   protocolFeeBps: 35,

@@ -207,7 +207,7 @@ async function initializeServices(retries = 3, delay = 5000) {
                 }
             } catch (error) {
                 console.error('✗ Error syncing EVM bonding curves:', error.message);
-                console.log('  ⚠ Make sure you have run the database migration: supabase-migration-multi-chain.sql');
+                console.log('  ⚠ Make sure you have run the database schema: db_migration/supabase-schema.sql');
                 // Don't fail startup if this fails
             }
 

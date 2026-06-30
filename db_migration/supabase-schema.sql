@@ -1,16 +1,12 @@
 -- ============================================================================
 -- PumpPoly — COMPLETE Supabase schema (greenfield / full reset)
 -- ============================================================================
--- Run this single file in the Supabase SQL Editor on a fresh project to create
--- everything the backend needs. It already folds in every migration:
---   • supabase-migration-multi-chain.sql      (chain columns + composite uniques)
---   • supabase-migration-liquidity-lock.sql   (LP lock columns on bonding_curves)
---   • supabase-migration-rewards.sql          (trader_fees.reward_fee + cooldown)
---   • supabase-migration-drop-chain-check.sql (no chain CHECK constraints here)
---   • supabase-migration-token-holders.sql    (token_holders on-chain balance index)
+-- Run this SINGLE file in the Supabase SQL Editor on a fresh project to create everything the
+-- backend needs. It is the COMPLETE schema — all historical migrations are folded in here
+-- (multi-chain columns, LP-lock columns, trader_fees rewards + cooldown, token_holders,
+-- reward_claims, profile banner). There are NO separate migration files; this is the only SQL to run.
 --
--- EXISTING projects: do NOT run this (it assumes empty tables). Apply the
--- individual migration files in date order instead.
+-- Assumes EMPTY tables (uses CREATE TABLE IF NOT EXISTS); run it once on a fresh project.
 --
 -- `chain` is a free-form slug: 'solana', 'base', 'polygon', 'bsc', 'eth', 'evm', …
 -- Amounts/prices/supplies are stored as TEXT to preserve full uint256 / u64 precision.
@@ -277,6 +273,26 @@ CREATE INDEX IF NOT EXISTS idx_token_holders_token ON token_holders(chain, token
 CREATE INDEX IF NOT EXISTS idx_token_holders_wallet ON token_holders(wallet_address);
 
 -- ============================================
+-- REWARD CLAIMS (per-wallet cumulative claim tracking; EVM + Solana)
+-- Source of truth for "how much a wallet has already withdrawn", so the double-claim lock
+-- survives backend restarts. EVM also tracks claimed on-chain; both chains use cumulative
+-- reward_fee minus already-claimed. Backend (service role) only.
+-- ============================================
+CREATE TABLE IF NOT EXISTS reward_claims (
+    id                 BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    chain              TEXT NOT NULL,
+    wallet             TEXT NOT NULL,
+    claimed_amount     TEXT NOT NULL DEFAULT '0',  -- cumulative lamports/wei already claimed
+    pending_amount     TEXT,                        -- in-flight claim amount (NULL when none)
+    pending_signature  TEXT,                        -- tx signature once the user submits
+    pending_expires_at TIMESTAMPTZ,                 -- in-flight lock expiry
+    updated_at         TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    CONSTRAINT reward_claims_chain_wallet_unique UNIQUE (chain, wallet)
+);
+
+CREATE INDEX IF NOT EXISTS reward_claims_chain_wallet_idx ON reward_claims (chain, wallet);
+
+-- ============================================
 -- ENABLE REALTIME FOR TABLES
 -- ============================================
 ALTER PUBLICATION supabase_realtime ADD TABLE tokens;
@@ -300,6 +316,7 @@ ALTER TABLE trader_fees ENABLE ROW LEVEL SECURITY;
 ALTER TABLE reward_distribution_config ENABLE ROW LEVEL SECURITY;
 ALTER TABLE reward_distribution_runs ENABLE ROW LEVEL SECURITY;
 ALTER TABLE token_holders ENABLE ROW LEVEL SECURITY;
+ALTER TABLE reward_claims ENABLE ROW LEVEL SECURITY;
 
 -- Public read access (frontend reads directly with the anon key)
 CREATE POLICY "Allow public read access" ON tokens FOR SELECT USING (true);
@@ -335,6 +352,7 @@ CREATE POLICY "Allow service role full access" ON trader_fees FOR ALL USING (aut
 CREATE POLICY "Allow service role full access" ON reward_distribution_config FOR ALL USING (auth.role() = 'service_role');
 CREATE POLICY "Allow service role full access" ON reward_distribution_runs FOR ALL USING (auth.role() = 'service_role');
 CREATE POLICY "Allow service role full access" ON token_holders FOR ALL USING (auth.role() = 'service_role');
+CREATE POLICY "Allow service role full access" ON reward_claims FOR ALL USING (auth.role() = 'service_role');
 
 -- ============================================
 -- updated_at TRIGGER

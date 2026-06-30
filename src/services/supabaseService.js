@@ -64,7 +64,7 @@ class SupabaseService {
         if (error) {
             // Provide helpful error message if chain column is missing
             if (error.message && (error.message.includes('chain') || error.message.includes('column') && error.message.includes('does not exist'))) {
-                throw new Error(`Database schema error: ${error.message}. Please run the migration script: supabase-migration-multi-chain.sql`);
+                throw new Error(`Database schema error: ${error.message}. Please run the migration script: db_migration/supabase-schema.sql`);
             }
             throw error;
         }
@@ -224,7 +224,7 @@ class SupabaseService {
         if (error) {
             // Provide helpful error message if chain column is missing
             if (error.message && (error.message.includes('chain') || (error.message.includes('column') && error.message.includes('does not exist')))) {
-                throw new Error(`Database schema error: ${error.message}. Please run the migration script: supabase-migration-multi-chain.sql`);
+                throw new Error(`Database schema error: ${error.message}. Please run the migration script: db_migration/supabase-schema.sql`);
             }
             throw error;
         }
@@ -345,7 +345,7 @@ class SupabaseService {
                 if (retryError) {
                     // Provide helpful error message if chain column is missing
                     if (retryError.message && (retryError.message.includes('chain') || (retryError.message.includes('column') && retryError.message.includes('does not exist')))) {
-                        throw new Error(`Database schema error: ${retryError.message}. Please run the migration script: supabase-migration-multi-chain.sql`);
+                        throw new Error(`Database schema error: ${retryError.message}. Please run the migration script: db_migration/supabase-schema.sql`);
                     }
                     throw retryError;
                 }
@@ -353,7 +353,7 @@ class SupabaseService {
             }
             // Provide helpful error message if chain column is missing
             if (error.message && (error.message.includes('chain') || (error.message.includes('column') && error.message.includes('does not exist')))) {
-                throw new Error(`Database schema error: ${error.message}. Please run the migration script: supabase-migration-multi-chain.sql`);
+                throw new Error(`Database schema error: ${error.message}. Please run the migration script: db_migration/supabase-schema.sql`);
             }
             throw error;
         }
@@ -405,7 +405,7 @@ class SupabaseService {
         if (error) {
             // If error is about chain column not existing, retry without chain
             if (error.message && (error.message.includes('chain') || error.message.includes('does not exist'))) {
-                console.warn('⚠ Chain column not found in database. Please run migration: supabase-migration-multi-chain.sql');
+                console.warn('⚠ Chain column not found in database. Please run migration: db_migration/supabase-schema.sql');
                 console.warn('⚠ Retrying query without chain column...');
                 const retryQuery = supabase
                     .from('bonding_curves')
@@ -413,7 +413,7 @@ class SupabaseService {
                     .eq('status', 'active');
                 const { data: retryData, error: retryError } = await retryQuery;
                 if (retryError) {
-                    throw new Error(`Database query failed: ${retryError.message}. Please run the migration script: supabase-migration-multi-chain.sql`);
+                    throw new Error(`Database query failed: ${retryError.message}. Please run the migration script: db_migration/supabase-schema.sql`);
                 }
                 return retryData.map(bc => ({ 
                     bondingCurveAddress: bc.bonding_curve_address,

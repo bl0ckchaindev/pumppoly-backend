@@ -15,9 +15,9 @@
  * Idempotent — after a clean run there are no 'evm' rows left, so re-running is a no-op.
  * Run AFTER setting EVM_CHAIN_SLUG=sepolia and restarting the backend (so it can't recreate 'evm').
  *
- *   node reconcile-chain-slug.js
+ *   node scripts/reconcile-chain-slug.js
  */
-require('dotenv').config();
+require('dotenv').config({ path: require('path').join(__dirname, '..', '.env') });
 const { createClient } = require('@supabase/supabase-js');
 
 const sb = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_KEY, { auth: { persistSession: false } });

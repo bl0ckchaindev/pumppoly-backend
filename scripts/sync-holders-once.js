@@ -1,15 +1,15 @@
 #!/usr/bin/env node
 /**
  * One-shot holder index population. Run AFTER applying
- * db_migration/supabase-migration-token-holders.sql. Does a full holder sync for every active
+ * db_migration/supabase-schema.sql. Does a full holder sync for every active
  * token (the cron job then keeps them fresh every 2 min). Safe to re-run (idempotent upserts).
  *
- *   node sync-holders-once.js
+ *   node scripts/sync-holders-once.js
  */
-require('dotenv').config();
-const supabaseService = require('./src/services/supabaseService');
-const holderService = require('./src/services/holderService');
-const { getEvmChainSlug } = require('./src/lib/chainUtils');
+require('dotenv').config({ path: require('path').join(__dirname, '..', '.env') });
+const supabaseService = require('../src/services/supabaseService');
+const holderService = require('../src/services/holderService');
+const { getEvmChainSlug } = require('../src/lib/chainUtils');
 
 async function main() {
   // Fail fast with a clear message if the table isn't there yet.

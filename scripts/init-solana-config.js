@@ -18,11 +18,11 @@
  * missing or stale devnet value can never accidentally initialize mainnet at 5 SOL.
  *
  * Usage:
- *   node init-solana-config.js
- *   REAL_SOL_THRESHOLD_LAMPORTS=1000000000 node init-solana-config.js   # graduate at 1 SOL
+ *   node scripts/init-solana-config.js
+ *   REAL_SOL_THRESHOLD_LAMPORTS=1000000000 node scripts/init-solana-config.js   # graduate at 1 SOL
  */
-require('dotenv').config();
-const solanaService = require('./src/services/solanaService');
+require('dotenv').config({ path: require('path').join(__dirname, '..', '.env') });
+const solanaService = require('../src/services/solanaService');
 
 // Caps enforced on-chain: total trade fee <= 200 bps, total migrate fee <= 500 bps.
 const DEFAULTS = {

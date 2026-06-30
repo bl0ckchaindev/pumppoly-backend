@@ -25,7 +25,7 @@ Runs on `http://localhost:3010` by default.
 
 ## Database
 
-Run `db_migration/supabase-schema.sql` in the Supabase SQL editor (fresh project). For an existing DB, apply the `supabase-migration-*.sql` files in date order.
+Run `db_migration/supabase-schema.sql` in the Supabase SQL editor on a fresh project. It's the complete schema (all migrations folded in) — the only SQL file you need.
 
 ## Environment Variables
 
@@ -86,15 +86,15 @@ Every trade charges **1.1%**, split into platform (0.35%), creator (0.45%), and 
 ## Helper Scripts
 
 ```bash
-node init-solana-config.js                         # one-time Solana config init (run after deploy)
-node manual-catchup.js <curveAddr> <start> <end>   # reprocess missed EVM trades
+node scripts/init-solana-config.js                         # one-time Solana config init (run after deploy)
+node scripts/manual-catchup.js <curveAddr> <start> <end>   # reprocess missed EVM trades
 ```
 
 ## Project Structure
 
 ```
 backend/
-├── db_migration/        # Supabase schema + migrations
+├── db_migration/        # Supabase schema (single consolidated file)
 ├── src/
 │   ├── abi/             # EVM ABIs
 │   ├── idl/fomo.json    # Solana program IDL
@@ -103,8 +103,7 @@ backend/
 │   ├── eventListener.js        # EVM listener
 │   ├── solanaEventListener.js  # Solana listener
 │   └── index.js         # entry point
-├── init-solana-config.js
-└── manual-catchup.js
+└── scripts/             # ops scripts: init-solana-config, set-solana-roles, sync-holders-once, manual-catchup, reconcile-chain-slug
 ```
 
 ## License
