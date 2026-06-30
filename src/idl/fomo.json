@@ -1,5 +1,5 @@
 {
-  "address": "Cnv3635XeU9j44qjLxLGednXWKewurNyqwfXrD8XbzVQ",
+  "address": "7jgvVcBnapgriRY2PeLK2x7NaZ2UxpvZhaZkoxjLWVmU",
   "metadata": {
     "name": "fomo",
     "version": "0.1.0",
@@ -672,13 +672,42 @@
           "signer": true
         },
         {
-          "name": "owner_quote_account",
+          "name": "global_config",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  103,
+                  108,
+                  111,
+                  98,
+                  97,
+                  108,
+                  95,
+                  99,
+                  111,
+                  110,
+                  102,
+                  105,
+                  103
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "name": "fee_recipient"
+        },
+        {
+          "name": "recipient_quote_account",
           "writable": true,
           "pda": {
             "seeds": [
               {
                 "kind": "account",
-                "path": "owner"
+                "path": "fee_recipient"
               },
               {
                 "kind": "const",
@@ -759,32 +788,6 @@
                 89
               ]
             }
-          }
-        },
-        {
-          "name": "global_config",
-          "writable": true,
-          "pda": {
-            "seeds": [
-              {
-                "kind": "const",
-                "value": [
-                  103,
-                  108,
-                  111,
-                  98,
-                  97,
-                  108,
-                  95,
-                  99,
-                  111,
-                  110,
-                  102,
-                  105,
-                  103
-                ]
-              }
-            ]
           }
         },
         {
@@ -1384,7 +1387,8 @@
           "writable": true
         },
         {
-          "name": "metadata_program"
+          "name": "metadata_program",
+          "address": "metaqbxxUerdq28cj1RbAWkYQm3ybzjb6a8bt518x1s"
         },
         {
           "name": "token_program",
@@ -1920,7 +1924,7 @@
         {
           "name": "amm_config",
           "writable": true,
-          "address": "EsTevfacYXpuho5VBuzBjDZi8dtWidGnXoSYAr8krTvz"
+          "address": "D4FPEruKEHrG5TenZ2mpDGEfu1iUvTiqBxvpU8HLBvC2"
         },
         {
           "name": "authority",
@@ -2058,11 +2062,11 @@
         {
           "name": "create_pool_fee",
           "writable": true,
-          "address": "3oE58BKVt8KuYkGxx8zBojugnymWmBiyafWgMrnb6eYy"
+          "address": "DNXgeM9EiiaAbaWvwjHj9fQQLAX5ZsfHyvmYUNRAdNC8"
         },
         {
           "name": "cp_swap_program",
-          "address": "DRaycpLY18LhpbydsBWbVJtxpNv9oXPgjRSfpF2bWpYb"
+          "address": "CPMMoo8L3F4NbTegBCKVNunggL7H1ZpdTHKxQB5qKP1C"
         },
         {
           "name": "token_program",
@@ -2581,7 +2585,8 @@
         {
           "name": "migrator",
           "docs": [
-            "Platform migrator or token creator (`bonding_curve.owner`); receives LP tokens"
+            "Platform migrator or token creator (`bonding_curve.owner`) — triggers the unlock and pays",
+            "rent. The LP tokens themselves are always sent to the creator, not to this signer."
           ],
           "writable": true,
           "signer": true
@@ -2694,13 +2699,19 @@
           "writable": true
         },
         {
-          "name": "migrator_lp_token",
+          "name": "creator",
+          "docs": [
+            "account, whether the platform migrator or the creator triggers the unlock."
+          ]
+        },
+        {
+          "name": "creator_lp_token",
           "writable": true,
           "pda": {
             "seeds": [
               {
                 "kind": "account",
-                "path": "migrator"
+                "path": "creator"
               },
               {
                 "kind": "const",
@@ -3342,6 +3353,10 @@
             "type": "pubkey"
           },
           {
+            "name": "fee_recipient",
+            "type": "pubkey"
+          },
+          {
             "name": "protocol_fee_bps",
             "type": "u32"
           },
@@ -3381,6 +3396,10 @@
       "type": {
         "kind": "struct",
         "fields": [
+          {
+            "name": "fee_recipient",
+            "type": "pubkey"
+          },
           {
             "name": "protocol_fee_bps",
             "type": "u32"
@@ -3543,6 +3562,10 @@
         "fields": [
           {
             "name": "owner",
+            "type": "pubkey"
+          },
+          {
+            "name": "fee_recipient",
             "type": "pubkey"
           },
           {
