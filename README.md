@@ -44,7 +44,6 @@ NET_ID=11155111                  # chain id (1, 137, 56, 8453, 11155111 …)
 HTTP_RPC_URL=https://...          # required
 WS_RPC_URL=wss://...              # optional, recommended
 CONTRACT_ADDRESS=0x...            # Factory contract
-EVM_TREASURY_PRIVATE_KEY=0x...    # pays EVM reward/creator payouts
 
 # Solana
 SOLANA_RPC_URL=https://api.devnet.solana.com
