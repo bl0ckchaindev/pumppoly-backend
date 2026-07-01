@@ -11,9 +11,11 @@ const tokenService = require('../services/tokenService');
 const supabaseService = require('../services/supabaseService');
 
 // Canonical message a creator signs to authorize a token media update. MUST match the frontend
-// `tokenMediaMessage` byte-for-byte.
-function tokenMediaMessage(chain, token, logo, banner) {
-  return `PumpPoly set token media\nchain: ${chain}\ntoken: ${token}\nlogo: ${logo}\nbanner: ${banner}`;
+// `tokenMediaMessage` byte-for-byte (including the description + socials, which for Solana are
+// off-chain and saved through this same signed path).
+function tokenMediaMessage(chain, token, logo, banner, description = '', twitter = '', telegram = '', website = '') {
+  return `PumpPoly set token media\nchain: ${chain}\ntoken: ${token}\nlogo: ${logo}\nbanner: ${banner}\n` +
+    `description: ${description}\ntwitter: ${twitter}\ntelegram: ${telegram}\nwebsite: ${website}`;
 }
 
 function verifySolanaSignature(message, signatureB64, publicKeyB58) {
@@ -226,11 +228,16 @@ router.post('/tokens/register', async (req, res) => {
  */
 router.post('/tokens/media', async (req, res) => {
   try {
-    const { chain, tokenAddress, logoUrl = '', bannerUrl = '', publicKey, signature } = req.body || {};
+    const {
+      chain, tokenAddress,
+      logoUrl = '', bannerUrl = '',
+      description = '', twitter = '', telegram = '', website = '',
+      publicKey, signature,
+    } = req.body || {};
     if (!chain || !tokenAddress) {
       return res.status(400).json({ success: false, error: 'chain and tokenAddress are required' });
     }
-    // Only Solana uses this endpoint (EVM media is set at registration time). ed25519 verification.
+    // Only Solana uses this endpoint (EVM media + metadata are set at registration time). ed25519.
     if (chain !== 'solana') {
       return res.status(400).json({ success: false, error: 'Unsupported chain for media update' });
     }
@@ -243,15 +250,13 @@ router.post('/tokens/media', async (req, res) => {
       return res.status(200).json({ success: false, found: false });
     }
 
-    // Write-once: media is immutable once stored. If the banner is already set, refuse to change it.
-    // (Returned as 200 so the client's retry loop stops instead of treating it as a transient error.)
-    const hasValue = (v) => typeof v === 'string' && v.trim() !== '';
-    if (hasValue(existing.bannerUrl)) {
-      return res.status(200).json({ success: false, found: true, locked: true, error: 'Token media already set' });
-    }
-
-    // Verify the signature is over the exact media values, by the token's creator.
-    const message = tokenMediaMessage(chain, String(tokenAddress), String(logoUrl), String(bannerUrl));
+    // Verify the signature is over the exact media + metadata values, by the token's creator.
+    // Per-field write-once is enforced in updateToken, so a token whose media is already set simply
+    // no-ops here (any still-empty description/socials get filled once).
+    const message = tokenMediaMessage(
+      chain, String(tokenAddress), String(logoUrl), String(bannerUrl),
+      String(description), String(twitter), String(telegram), String(website)
+    );
     if (!verifySolanaSignature(message, signature, publicKey)) {
       return res.status(401).json({ success: false, error: 'Invalid signature' });
     }
@@ -259,10 +264,16 @@ router.post('/tokens/media', async (req, res) => {
       return res.status(403).json({ success: false, error: 'Signer is not the token creator' });
     }
 
-    // Only fill fields that aren't set yet (Solana logo is set on-chain at creation).
-    const update = { bannerUrl: String(bannerUrl) };
-    if (!hasValue(existing.logoUrl)) update.logoUrl = String(logoUrl);
-    const token = await supabaseService.updateToken(tokenAddress, update, chain);
+    // Fill only fields that aren't set yet (updateToken applies write-once per field). The Solana
+    // indexer seeds logo on-chain and description/socials as empty strings, so this fills them once.
+    const token = await supabaseService.updateToken(tokenAddress, {
+      logoUrl: String(logoUrl),
+      bannerUrl: String(bannerUrl),
+      description: String(description),
+      twitter: String(twitter),
+      telegram: String(telegram),
+      website: String(website),
+    }, chain);
     return res.status(200).json({ success: true, found: true, token });
   } catch (err) {
     console.error('POST /tokens/media error:', err);

@@ -104,6 +104,21 @@ class SupabaseService {
         if (updateData.bannerUrl !== undefined && !(existing && hasValue(existing.bannerUrl))) {
             mappedData.banner_url = String(updateData.bannerUrl);
         }
+        // Off-chain metadata (Solana description + socials): the indexer seeds these empty, so fill
+        // them once here. Same write-once rule — never overwrite a value that's already stored, and
+        // never clobber an existing value with an empty one.
+        if (updateData.description !== undefined && hasValue(updateData.description) && !(existing && hasValue(existing.description))) {
+            mappedData.description = String(updateData.description);
+        }
+        if (updateData.twitter !== undefined && hasValue(updateData.twitter) && !(existing && hasValue(existing.twitter))) {
+            mappedData.twitter = String(updateData.twitter);
+        }
+        if (updateData.telegram !== undefined && hasValue(updateData.telegram) && !(existing && hasValue(existing.telegram))) {
+            mappedData.telegram = String(updateData.telegram);
+        }
+        if (updateData.website !== undefined && hasValue(updateData.website) && !(existing && hasValue(existing.website))) {
+            mappedData.website = String(updateData.website);
+        }
         if (Object.keys(mappedData).length === 0) return existing;
 
         let query = supabase.from('tokens').update(mappedData).eq('token_address', address);
