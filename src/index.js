@@ -97,6 +97,11 @@ testSupabaseConnection();
 
 const app = express();
 
+// Behind the nginx reverse proxy (localhost). Trust only the loopback proxy so req.ip reflects the
+// real client from X-Forwarded-For — required for express-rate-limit to key on the right IP, without
+// trusting arbitrary client-supplied headers (which 'true' would and enables IP spoofing).
+app.set('trust proxy', 'loopback');
+
 // Security headers
 app.use(securityHeaders);
 
