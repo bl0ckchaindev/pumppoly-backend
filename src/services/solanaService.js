@@ -584,12 +584,13 @@ class SolanaService {
      * @param {string|number|bigint} params.realSolThreshold - Real SOL threshold in lamports (u64)
      * @returns {Promise<string>} Transaction signature
      */
-    async updateGlobalConfig(params) {
+    async updateGlobalConfig(params, ownerKeypair = null) {
         await this.initialize();
-        if (!this.treasuryKeypair) {
-            throw new Error('SOLANA_TREASURY_PRIVATE_KEY is not set; cannot update global config');
+        const signerKeypair = ownerKeypair || this.treasuryKeypair;
+        if (!signerKeypair) {
+            throw new Error('No owner keypair available; cannot update global config');
         }
-        const signer = this.treasuryKeypair.publicKey; // must be the CURRENT config owner
+        const signer = signerKeypair.publicKey; // must be the CURRENT config owner
         const globalConfig = this.getGlobalConfigPDA();
         // Preserve the existing owner / migrator / fee_recipient unless explicitly overridden, so a
         // routine fee/threshold update never clobbers a handed-over role. (update_config writes all
@@ -619,12 +620,12 @@ class SolanaService {
                 owner: signer,
                 globalConfig
             })
-            .signers([this.treasuryKeypair])
+            .signers([signerKeypair])
             .transaction();
         const sig = await sendAndConfirmTransaction(
             this.connection,
             tx,
-            [this.treasuryKeypair],
+            [signerKeypair],
             { commitment: 'confirmed', skipPreflight: false }
         );
         return sig;
