@@ -1020,12 +1020,23 @@ class SupabaseService {
         return data || null;
     }
 
-    /** Open an in-flight claim lock (overwrites any prior pending; preserves claimed_amount). */
-    async setPendingClaim(chain, wallet, amount, expiresAtIso) {
+    /**
+     * Open an in-flight claim lock (overwrites any prior pending; preserves claimed amounts).
+     * `amount` is the TOTAL of the payout (what the on-chain transfer is verified against);
+     * `creatorAmount` is the creator-fee portion of it (0 for a trader-only claim).
+     */
+    async setPendingClaim(chain, wallet, amount, expiresAtIso, creatorAmount = '0') {
         const { error } = await supabase
             .from('reward_claims')
             .upsert(
-                { chain, wallet, pending_amount: String(amount), pending_signature: null, pending_expires_at: expiresAtIso, updated_at: new Date().toISOString() },
+                {
+                    chain, wallet,
+                    pending_amount: String(amount),
+                    pending_creator_amount: String(creatorAmount || '0'),
+                    pending_signature: null,
+                    pending_expires_at: expiresAtIso,
+                    updated_at: new Date().toISOString(),
+                },
                 { onConflict: 'chain,wallet' }
             );
         if (error) throw new Error('setPendingClaim: ' + error.message);
@@ -1040,27 +1051,129 @@ class SupabaseService {
         if (error) throw new Error('attachPendingSignature: ' + error.message);
     }
 
-    /** Add `addAmount` to cumulative claimed and clear the in-flight lock. Returns new cumulative. */
-    async finalizeClaim(chain, wallet, addAmount) {
+    /**
+     * Finalize the in-flight claim: advance both cumulative claimed counters, clear the lock, and
+     * record a history row. pending_amount is the TRADER portion (the verified treasury transfer);
+     * pending_creator_amount is the creator-vault payout carried in the same transaction.
+     * `txSignature` (or the recorded pending_signature) identifies the on-chain payout.
+     * No-op when there is no pending claim (idempotent under reconcile retries).
+     */
+    async finalizeClaim(chain, wallet, txSignature = null) {
         const rec = await this.getRewardClaimRecord(chain, wallet);
-        const next = (BigInt((rec && rec.claimed_amount) || '0') + BigInt(String(addAmount))).toString();
+        if (!rec || !rec.pending_amount) return rec;
+        const traderPart = BigInt(rec.pending_amount);
+        const creatorPart = BigInt(rec.pending_creator_amount || '0');
+        const total = traderPart + creatorPart;
+        const nextTrader = (BigInt(rec.claimed_amount || '0') + traderPart).toString();
+        const nextCreator = (BigInt(rec.claimed_creator_amount || '0') + creatorPart).toString();
         const { error } = await supabase
             .from('reward_claims')
             .upsert(
-                { chain, wallet, claimed_amount: next, pending_amount: null, pending_signature: null, pending_expires_at: null, updated_at: new Date().toISOString() },
+                {
+                    chain, wallet,
+                    claimed_amount: nextTrader,
+                    claimed_creator_amount: nextCreator,
+                    pending_amount: null,
+                    pending_creator_amount: null,
+                    pending_signature: null,
+                    pending_expires_at: null,
+                    updated_at: new Date().toISOString(),
+                },
                 { onConflict: 'chain,wallet' }
             );
         if (error) throw new Error('finalizeClaim: ' + error.message);
-        return next;
+        await this.insertRewardClaimHistory({
+            chain, wallet,
+            traderAmount: traderPart.toString(),
+            creatorAmount: creatorPart.toString(),
+            totalAmount: total.toString(),
+            txSignature: txSignature || rec.pending_signature || `finalized-${Date.now()}`,
+        });
+        return { claimed_amount: nextTrader, claimed_creator_amount: nextCreator };
     }
 
-    /** Drop the in-flight lock without changing claimed_amount (expired / failed claim). */
+    /** Drop the in-flight lock without changing claimed amounts (expired / failed claim). */
     async clearPendingClaim(chain, wallet) {
         const { error } = await supabase
             .from('reward_claims')
-            .update({ pending_amount: null, pending_signature: null, pending_expires_at: null, updated_at: new Date().toISOString() })
+            .update({ pending_amount: null, pending_creator_amount: null, pending_signature: null, pending_expires_at: null, updated_at: new Date().toISOString() })
             .eq('chain', chain).eq('wallet', wallet);
         if (error) console.error('clearPendingClaim:', error.message);
+    }
+
+    /**
+     * All-time cumulative creator fee for a wallet on a chain (sum of tokens.fee_amount across the
+     * tokens they created). fee_amount is accumulate-only in the claim-only model — nothing resets
+     * it — so this is a monotonic cumulative, mirroring getCumulativeRewardFeeByWallet for traders.
+     */
+    async getCumulativeCreatorFeeByWallet(walletAddress, chain) {
+        const wallet = String(walletAddress || '').trim();
+        if (!wallet) return '0';
+        let query = supabase.from('tokens').select('fee_amount').eq('creator', wallet);
+        if (chain) query = query.eq('chain', chain);
+        const { data, error } = await query;
+        if (error) { console.error('getCumulativeCreatorFeeByWallet:', error.message); return '0'; }
+        let total = 0n;
+        for (const row of (data || [])) {
+            try { total += BigInt(row.fee_amount || '0'); } catch { /* skip malformed */ }
+        }
+        return total.toString();
+    }
+
+    /**
+     * Record a creator-only claim (paid on-chain from the creator's vault — no treasury lock
+     * involved): advance claimed_creator_amount and write the history row.
+     */
+    async recordCreatorClaim(chain, wallet, amount, txSignature) {
+        const rec = await this.getRewardClaimRecord(chain, wallet);
+        const nextCreator = (BigInt((rec && rec.claimed_creator_amount) || '0') + BigInt(String(amount))).toString();
+        const { error } = await supabase
+            .from('reward_claims')
+            .upsert(
+                { chain, wallet, claimed_creator_amount: nextCreator, updated_at: new Date().toISOString() },
+                { onConflict: 'chain,wallet' }
+            );
+        if (error) throw new Error('recordCreatorClaim: ' + error.message);
+        await this.insertRewardClaimHistory({
+            chain, wallet,
+            traderAmount: '0',
+            creatorAmount: String(amount),
+            totalAmount: String(amount),
+            txSignature,
+        });
+    }
+
+    /** Record a finalized payout (idempotent: unique on (chain, tx_signature)). */
+    async insertRewardClaimHistory({ chain, wallet, traderAmount, creatorAmount, totalAmount, txSignature }) {
+        const { error } = await supabase
+            .from('reward_claim_history')
+            .insert({
+                chain, wallet,
+                trader_amount: String(traderAmount || '0'),
+                creator_amount: String(creatorAmount || '0'),
+                total_amount: String(totalAmount),
+                tx_signature: String(txSignature),
+            });
+        if (error) {
+            if (error.code === '23505' || (error.message && error.message.includes('duplicate'))) return; // already recorded
+            console.error('insertRewardClaimHistory:', error.message);
+        }
+    }
+
+    /** Finalized claims for a wallet, newest first. */
+    async getRewardClaimHistory(walletAddress, chain, limit = 50) {
+        const wallet = String(walletAddress || '').trim();
+        if (!wallet) return [];
+        let query = supabase
+            .from('reward_claim_history')
+            .select('*')
+            .eq('wallet', wallet)
+            .order('created_at', { ascending: false })
+            .limit(Math.min(Number(limit) || 50, 200));
+        if (chain) query = query.eq('chain', chain);
+        const { data, error } = await query;
+        if (error) { console.error('getRewardClaimHistory:', error.message); return []; }
+        return data || [];
     }
 
     async markTraderFeesAsClaimed(ids, claimTxSignature = null) {

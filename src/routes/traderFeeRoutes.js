@@ -290,7 +290,7 @@ async function reconcileSolanaClaim(wallet) {
             .verifyClaimPayout(rec.pending_signature, wallet, rec.pending_amount)
             .catch(() => false);
         if (paid) {
-            await supabaseService.finalizeClaim('solana', wallet, rec.pending_amount);
+            await supabaseService.finalizeClaim('solana', wallet, rec.pending_signature);
             return await supabaseService.getRewardClaimRecord('solana', wallet);
         }
     }
@@ -304,7 +304,7 @@ async function reconcileSolanaClaim(wallet) {
             .findTreasuryPayout(wallet, rec.pending_amount, since)
             .catch(() => null);
         if (paidSig) {
-            await supabaseService.finalizeClaim('solana', wallet, rec.pending_amount);
+            await supabaseService.finalizeClaim('solana', wallet, paidSig);
         } else {
             await supabaseService.clearPendingClaim('solana', wallet);
         }
@@ -313,15 +313,24 @@ async function reconcileSolanaClaim(wallet) {
     return rec; // in-flight, still within the window
 }
 
-function solanaClaimableLamports(cumulative, rec) {
-    const claimed = BigInt((rec && rec.claimed_amount) || '0');
+/**
+ * Trader claimable = cumulative reward_fee − claimed_amount − the active in-flight lock.
+ * (pending_amount is the TRADER portion the treasury pays — the creator portion of a combined
+ * claim is paid by the program from the creator's on-chain vault, which is its own double-claim
+ * protection, so it never enters the lock.)
+ * Creator claimable is NOT computed from the DB: it is the wallet's on-chain creator_vault WSOL
+ * balance (solanaService.getCreatorVaultBalanceLamports) — the program deposits the 0.45% there
+ * on every trade and claim_creator_fee drains it.
+ */
+function solanaTraderClaimable(traderCumulative, rec) {
     const pendingActive =
-        rec && rec.pending_amount && rec.pending_expires_at && new Date(rec.pending_expires_at).getTime() > Date.now()
-            ? BigInt(rec.pending_amount)
-            : 0n;
-    const c = BigInt(cumulative) - claimed - pendingActive;
+        rec && rec.pending_amount && rec.pending_expires_at && new Date(rec.pending_expires_at).getTime() > Date.now();
+    const pending = pendingActive ? BigInt(rec.pending_amount) : 0n;
+    const c = BigInt(traderCumulative) - BigInt((rec && rec.claimed_amount) || '0') - pending;
     return c > 0n ? c : 0n;
 }
+
+const fmtLamports = (v) => (Number(v) / 1e9).toFixed(9);
 
 /**
  * GET /reward-claimable-solana?wallet=...
@@ -335,17 +344,181 @@ router.get('/reward-claimable-solana', async (req, res) => {
         }
         const rec = await reconcileSolanaClaim(wallet);
         const cumulative = await supabaseService.getCumulativeRewardFeeByWallet(wallet, 'solana');
-        const claimable = solanaClaimableLamports(cumulative, rec);
+        const trader = solanaTraderClaimable(cumulative, rec);
         return res.json({
             wallet,
             chain: 'solana',
-            claimableAmount: claimable.toString(),
-            claimableFormatted: (Number(claimable) / 1e9).toFixed(9),
+            claimableAmount: trader.toString(),
+            claimableFormatted: fmtLamports(trader),
             decimals: 9,
         });
     } catch (err) {
         console.error('GET /reward-claimable-solana error:', err.message);
         return res.status(500).json({ error: err.message || 'Failed to get claimable' });
+    }
+});
+
+/**
+ * GET /rewards-summary?wallet=...&chain=solana|base|...
+ * Unified per-wallet rewards view for the modal + profile page: trader and creator cumulative /
+ * claimed / claimable. On Solana both categories are claimable (paid from the treasury). On EVM
+ * the creator fee is paid to the creator's wallet at trade time by the contract (autoPaid), and
+ * the trader claimable is resolved on-chain by the frontend via the RewardClaim voucher flow.
+ */
+router.get('/rewards-summary', async (req, res) => {
+    try {
+        const wallet = (req.query.wallet || req.query.walletAddress || '').trim();
+        let chain = (req.query.chain || '').toLowerCase() || detectChain(wallet);
+        if (!wallet || !chain) {
+            return res.status(400).json({ error: 'wallet and chain are required' });
+        }
+
+        if (isSolanaChain(chain)) {
+            if (!isValidSolanaAddress(wallet)) {
+                return res.status(400).json({ error: 'Invalid Solana wallet address' });
+            }
+            const rec = await reconcileSolanaClaim(wallet);
+            const [traderCum, creatorCum, creatorVault] = await Promise.all([
+                supabaseService.getCumulativeRewardFeeByWallet(wallet, 'solana'),
+                supabaseService.getCumulativeCreatorFeeByWallet(wallet, 'solana'),
+                solanaService.getCreatorVaultBalanceLamports(wallet).catch(() => 0n),
+            ]);
+            const trader = solanaTraderClaimable(traderCum, rec);
+            const creator = creatorVault; // on-chain vault balance IS the claimable creator amount
+            const total = trader + creator;
+            return res.json({
+                wallet,
+                chain,
+                decimals: 9,
+                trader: {
+                    cumulative: traderCum,
+                    claimed: (rec && rec.claimed_amount) || '0',
+                    claimable: trader.toString(),
+                    claimableFormatted: fmtLamports(trader),
+                },
+                creator: {
+                    cumulative: creatorCum,
+                    claimed: (rec && rec.claimed_creator_amount) || '0',
+                    claimable: creator.toString(),
+                    claimableFormatted: fmtLamports(creator),
+                    autoPaid: false,
+                },
+                totalClaimable: total.toString(),
+                totalClaimableFormatted: fmtLamports(total),
+            });
+        }
+
+        if (!isEvmCompatibleChain(chain)) {
+            return res.status(400).json({ error: `Unsupported chain '${chain}'` });
+        }
+        if (!isValidEvmAddress(wallet)) {
+            return res.status(400).json({ error: 'Invalid EVM wallet address' });
+        }
+        const normalized = wallet.toLowerCase();
+        const [traderCum, creatorCum] = await Promise.all([
+            supabaseService.getCumulativeRewardFeeByWallet(normalized, chain),
+            supabaseService.getCumulativeCreatorFeeByWallet(normalized, chain),
+        ]);
+        return res.json({
+            wallet: normalized,
+            chain,
+            decimals: 18,
+            trader: {
+                cumulative: traderCum,
+                // claimed lives on-chain in RewardClaim; the frontend resolves the claimable delta
+                // via GET /reward-voucher + the contract's claimable view.
+                claimed: null,
+                claimable: null,
+            },
+            creator: {
+                cumulative: creatorCum,
+                claimed: creatorCum, // paid instantly at trade time by the bonding curve
+                claimable: '0',
+                autoPaid: true,
+            },
+            totalClaimable: null,
+        });
+    } catch (err) {
+        console.error('GET /rewards-summary error:', err.message);
+        return res.status(500).json({ error: err.message || 'Failed to get rewards summary' });
+    }
+});
+
+/**
+ * GET /reward-claim-history?wallet=...&chain=...&limit=...
+ * Finalized claims for a wallet, newest first (drives the profile page history tab).
+ */
+router.get('/reward-claim-history', async (req, res) => {
+    try {
+        let wallet = (req.query.wallet || req.query.walletAddress || '').trim();
+        const chain = (req.query.chain || '').toLowerCase() || null;
+        if (!wallet) return res.status(400).json({ error: 'wallet is required' });
+        if (wallet.startsWith('0x')) wallet = wallet.toLowerCase();
+        const rows = await supabaseService.getRewardClaimHistory(wallet, chain, req.query.limit);
+        return res.json({
+            wallet,
+            chain,
+            claims: rows.map((r) => ({
+                chain: r.chain,
+                traderAmount: r.trader_amount,
+                creatorAmount: r.creator_amount,
+                totalAmount: r.total_amount,
+                txSignature: r.tx_signature,
+                createdAt: r.created_at,
+            })),
+        });
+    } catch (err) {
+        console.error('GET /reward-claim-history error:', err.message);
+        return res.status(500).json({ error: err.message || 'Failed to get claim history' });
+    }
+});
+
+/**
+ * POST /reward-claim/evm/record   Body: { wallet, chain?, txHash }
+ * Record an EVM RewardClaim payout in the history table. Trust-minimized: the backend verifies the
+ * receipt on-chain and extracts the Claimed(wallet, amount, cumulative) event — the caller can't
+ * fabricate amounts. Idempotent per (chain, txHash).
+ */
+router.post('/reward-claim/evm/record', async (req, res) => {
+    try {
+        const wallet = (req.body?.wallet || '').trim().toLowerCase();
+        const txHash = (req.body?.txHash || '').trim();
+        const chain = ((req.body?.chain || '').toLowerCase()) || getEvmChainSlug();
+        if (!isValidEvmAddress(wallet)) return res.status(400).json({ error: 'Invalid EVM wallet address' });
+        if (!/^0x[a-fA-F0-9]{64}$/.test(txHash)) return res.status(400).json({ error: 'Invalid txHash' });
+        const claimContract = (process.env.REWARD_CLAIM_ADDRESS || '').toLowerCase();
+        if (!claimContract) return res.status(503).json({ error: 'Reward claim not configured' });
+
+        const { httpRpcUrl } = require('../config');
+        const provider = new ethers.providers.JsonRpcProvider(httpRpcUrl);
+        const receipt = await provider.getTransactionReceipt(txHash);
+        if (!receipt || receipt.status !== 1) {
+            return res.status(400).json({ error: 'Transaction not found or not confirmed yet' });
+        }
+        const iface = new ethers.utils.Interface([
+            'event Claimed(address indexed wallet, uint256 amount, uint256 cumulative)',
+        ]);
+        const topic = iface.getEventTopic('Claimed');
+        let amount = null;
+        for (const log of receipt.logs) {
+            if (log.address.toLowerCase() !== claimContract || log.topics[0] !== topic) continue;
+            const parsed = iface.parseLog(log);
+            if (parsed.args.wallet.toLowerCase() === wallet) { amount = parsed.args.amount.toString(); break; }
+        }
+        if (amount === null) {
+            return res.status(400).json({ error: 'No matching Claimed event for this wallet in that transaction' });
+        }
+        await supabaseService.insertRewardClaimHistory({
+            chain, wallet,
+            traderAmount: amount,
+            creatorAmount: '0', // EVM creator fees are paid at trade time, never through RewardClaim
+            totalAmount: amount,
+            txSignature: txHash.toLowerCase(),
+        });
+        return res.json({ success: true, amount });
+    } catch (err) {
+        console.error('POST /reward-claim/evm/record error:', err.message);
+        return res.status(500).json({ error: err.message || 'Failed to record claim' });
     }
 });
 
@@ -384,25 +557,55 @@ router.post('/claim-trader-fee/solana/build', async (req, res) => {
             return res.status(409).json({ error: 'A claim is already in progress — finish it or wait a moment, then retry.' });
         }
 
-        const cumulative = await supabaseService.getCumulativeRewardFeeByWallet(wallet, 'solana');
-        const claimed = BigInt((rec && rec.claimed_amount) || '0');
-        const claimable = BigInt(cumulative) - claimed;
+        // Scope: claim only trader rewards, only creator rewards, or both — always ONE transaction.
+        // Trader rewards are a treasury→user transfer (treasury partial-signs); creator rewards are
+        // the program's own claim_creator_fee draining the wallet's on-chain creator vault. The
+        // creator part needs no lock — the vault balance makes double-claims impossible on-chain.
+        const scope = ['trader', 'creator', 'both'].includes(req.body?.scope) ? req.body.scope : 'both';
+
+        const [traderCum, creatorVault] = await Promise.all([
+            supabaseService.getCumulativeRewardFeeByWallet(wallet, 'solana'),
+            solanaService.getCreatorVaultBalanceLamports(wallet).catch(() => 0n),
+        ]);
+        const traderAmount = scope === 'creator' ? 0n : solanaTraderClaimable(traderCum, rec);
+        const creatorAmount = scope === 'trader' ? 0n : creatorVault;
+        const claimable = traderAmount + creatorAmount;
         if (claimable <= 0n) {
             return res.status(400).json({ error: 'No claimable rewards for this wallet' });
         }
 
-        const built = await solanaService.buildTraderFeeClaimTx(wallet, claimable);
-        await supabaseService.setPendingClaim(
-            'solana',
-            wallet,
-            claimable.toString(),
-            new Date(Date.now() + SOLANA_CLAIM_TTL_MS).toISOString()
-        );
+        // Never open a treasury payout it can't cover: the user would sign a doomed transaction and
+        // then hit the in-flight 409 lock on retry. The buffer keeps the treasury rent-exempt after
+        // the transfer. (Creator-only claims skip this — the treasury pays nothing there.)
+        if (traderAmount > 0n) {
+            const treasuryLamports = await solanaService.getTreasuryBalanceLamports();
+            const RENT_BUFFER_LAMPORTS = 1_000_000n; // 0.001 SOL
+            if (treasuryLamports !== null && BigInt(treasuryLamports) < traderAmount + RENT_BUFFER_LAMPORTS) {
+                console.error(`Solana claim blocked: treasury has ${treasuryLamports} lamports, needs ${traderAmount + RENT_BUFFER_LAMPORTS} — FUND THE TREASURY`);
+                return res.status(503).json({ error: 'Trader rewards are temporarily unavailable while the reward pool is refilled — please try again later.' });
+            }
+        }
+
+        const built = await solanaService.buildRewardClaimTx(wallet, traderAmount, creatorAmount > 0n);
+        // Lock only the treasury exposure. pending_amount = trader portion (what verifyClaimPayout
+        // checks); pending_creator_amount = the expected vault payout, recorded on finalize.
+        if (traderAmount > 0n) {
+            await supabaseService.setPendingClaim(
+                'solana',
+                wallet,
+                traderAmount.toString(),
+                new Date(Date.now() + SOLANA_CLAIM_TTL_MS).toISOString(),
+                creatorAmount.toString()
+            );
+        }
 
         return res.json({
-            transaction: built.transaction, // base64, partially signed by treasury; user is fee payer
+            transaction: built.transaction, // base64; user is fee payer and co-signs
             amount: claimable.toString(),
-            amountFormatted: (Number(claimable) / 1e9).toFixed(9),
+            amountFormatted: fmtLamports(claimable),
+            traderAmount: traderAmount.toString(),
+            creatorAmount: creatorAmount.toString(),
+            scope,
             decimals: 9,
         });
     } catch (err) {
@@ -427,9 +630,18 @@ router.post('/claim-trader-fee/solana/confirm', async (req, res) => {
             return res.status(400).json({ error: 'wallet and signature are required' });
         }
         const rec = await supabaseService.getRewardClaimRecord('solana', wallet);
+
+        // Creator-only claim: no treasury lock was opened (the on-chain vault is its own
+        // double-claim protection). Verify the vault actually paid out in this tx and record it.
         if (!rec || !rec.pending_amount) {
-            return res.status(400).json({ error: 'No pending claim for this wallet (it may have expired — rebuild and retry)' });
+            const creatorPaid = await solanaService.verifyCreatorVaultClaim(signature, wallet).catch(() => null);
+            if (!creatorPaid) {
+                return res.status(400).json({ error: 'No pending claim for this wallet (it may have expired — rebuild and retry)' });
+            }
+            await supabaseService.recordCreatorClaim('solana', wallet, creatorPaid, signature);
+            return res.json({ success: true, signature, amount: creatorPaid });
         }
+
         // Record the signature first so reconcile can finalize even if the user disappears.
         await supabaseService.attachPendingSignature('solana', wallet, signature);
 
@@ -439,8 +651,8 @@ router.post('/claim-trader-fee/solana/confirm', async (req, res) => {
         if (!paid) {
             return res.json({ success: false, pending: true, message: 'Claim submitted — confirming on-chain. Your balance will update shortly.' });
         }
-        const amount = rec.pending_amount;
-        await supabaseService.finalizeClaim('solana', wallet, amount);
+        const amount = (BigInt(rec.pending_amount) + BigInt(rec.pending_creator_amount || '0')).toString();
+        await supabaseService.finalizeClaim('solana', wallet, signature);
         return res.json({ success: true, signature, amount });
     } catch (err) {
         console.error('POST /claim-trader-fee/solana/confirm error:', err.message);

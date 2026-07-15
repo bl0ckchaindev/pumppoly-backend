@@ -1,10 +1,11 @@
 const { Connection, PublicKey, Keypair, Transaction, SystemProgram, sendAndConfirmTransaction, SYSVAR_RENT_PUBKEY } = require('@solana/web3.js');
 const { Program, AnchorProvider, Wallet, BN } = require('@coral-xyz/anchor');
-const { 
-    TOKEN_PROGRAM_ID, 
-    ASSOCIATED_TOKEN_PROGRAM_ID, 
+const {
+    TOKEN_PROGRAM_ID,
+    ASSOCIATED_TOKEN_PROGRAM_ID,
     getAssociatedTokenAddressSync,
-    createAssociatedTokenAccountIdempotentInstruction
+    createAssociatedTokenAccountIdempotentInstruction,
+    createCloseAccountInstruction
 } = require('@solana/spl-token');
 const path = require('path');
 const IDL = require(path.join(__dirname, '../idl/fomo.json'));
@@ -657,6 +658,173 @@ class SolanaService {
             { commitment: 'confirmed', skipPreflight: false }
         );
         return sig;
+    }
+
+    /** Treasury's native SOL balance in lamports, or null when the treasury key isn't configured. */
+    async getTreasuryBalanceLamports() {
+        await this.initialize();
+        if (!this.treasuryKeypair) return null;
+        return await this.connection.getBalance(this.treasuryKeypair.publicKey);
+    }
+
+    /**
+     * On-chain claimable creator fees for a wallet: the WSOL balance of their creator_vault ATA.
+     * The program deposits the 0.45% creator fee here on every buy/sell, and claim_creator_fee
+     * pays it out — so this balance IS the source of truth (not the DB ledger).
+     */
+    async getCreatorVaultBalanceLamports(creatorAddress) {
+        await this.initialize();
+        const vault = this.getCreatorVaultPDA(creatorAddress);
+        const ata = getAssociatedTokenAddressSync(NATIVE_MINT, vault, true);
+        try {
+            const bal = await this.connection.getTokenAccountBalance(ata);
+            return BigInt(bal.value.amount);
+        } catch {
+            return 0n; // no vault token account yet — nothing accrued
+        }
+    }
+
+    /**
+     * Build the unified reward-claim transaction the USER pays gas for, containing (as requested):
+     *   - creator part: claim_creator_fee (their on-chain vault → their WSOL ATA) + close the WSOL
+     *     ATA so the fees land as native SOL. Trustless — only the creator's signature moves it.
+     *   - trader part: treasury → user System transfer (treasury partial-signs).
+     * One transaction, one wallet confirmation, covering scope trader / creator / both.
+     */
+    async buildRewardClaimTx(toAddress, traderLamports, includeCreator) {
+        await this.initialize();
+        const toPubkey = new PublicKey(toAddress);
+        const traderAmount = typeof traderLamports === 'bigint' ? traderLamports : BigInt(String(traderLamports || '0'));
+
+        const ixs = [];
+        if (includeCreator) {
+            const creatorVault = this.getCreatorVaultPDA(toAddress);
+            const vaultQuoteAccount = getAssociatedTokenAddressSync(NATIVE_MINT, creatorVault, true);
+            const creatorQuoteAccount = getAssociatedTokenAddressSync(NATIVE_MINT, toPubkey, false);
+            ixs.push(createAssociatedTokenAccountIdempotentInstruction(toPubkey, creatorQuoteAccount, toPubkey, NATIVE_MINT));
+            ixs.push(await this.program.methods
+                .claimCreatorFee()
+                .accountsStrict({
+                    creator: toPubkey,
+                    creatorQuoteAccount,
+                    creatorVault,
+                    creatorVaultQuoteAccount: vaultQuoteAccount,
+                    quoteMint: NATIVE_MINT,
+                    systemProgram: SystemProgram.programId,
+                    tokenProgram: TOKEN_PROGRAM_ID,
+                    associatedTokenProgram: ASSOCIATED_TOKEN_PROGRAM_ID,
+                    rent: SYSVAR_RENT_PUBKEY,
+                })
+                .instruction());
+            // Unwrap: closing the WSOL ATA credits its whole balance to the creator as native SOL.
+            ixs.push(createCloseAccountInstruction(creatorQuoteAccount, toPubkey, toPubkey));
+        }
+        if (traderAmount > 0n) {
+            if (!this.treasuryKeypair) {
+                throw new Error('SOLANA_TREASURY_PRIVATE_KEY is not set; cannot build claim transaction');
+            }
+            ixs.push(SystemProgram.transfer({
+                fromPubkey: this.treasuryKeypair.publicKey,
+                toPubkey,
+                lamports: Number(traderAmount),
+            }));
+        }
+        if (ixs.length === 0) throw new Error('Nothing to claim');
+
+        const tx = new Transaction().add(...ixs);
+        const { blockhash, lastValidBlockHeight } = await this.connection.getLatestBlockhash('confirmed');
+        tx.recentBlockhash = blockhash;
+        tx.feePayer = toPubkey; // user pays the network fee
+        if (traderAmount > 0n) tx.partialSign(this.treasuryKeypair); // authorize the treasury transfer only
+
+        const serialized = tx.serialize({ requireAllSignatures: false, verifySignatures: false }).toString('base64');
+        return { transaction: serialized, blockhash, lastValidBlockHeight };
+    }
+
+    /**
+     * Verify `signature` is a confirmed tx in which the wallet's creator_vault WSOL ATA balance
+     * DECREASED (i.e. an actual claim_creator_fee payout). Returns the claimed lamports as a
+     * string, or null if unconfirmed / errored / no vault decrease. Used to record history and
+     * advance claimed_creator_amount — the vault itself makes double-claims impossible.
+     */
+    async verifyCreatorVaultClaim(signature, creatorAddress) {
+        await this.initialize();
+        const tx = await this.connection.getParsedTransaction(signature, {
+            commitment: 'confirmed',
+            maxSupportedTransactionVersion: 0,
+        });
+        if (!tx || (tx.meta && tx.meta.err)) return null;
+        const vault = this.getCreatorVaultPDA(creatorAddress);
+        const vaultAta = getAssociatedTokenAddressSync(NATIVE_MINT, vault, true).toBase58();
+        const keys = tx.transaction.message.accountKeys.map((k) => (k.pubkey ? k.pubkey.toBase58() : String(k)));
+        const idx = keys.indexOf(vaultAta);
+        if (idx < 0) return null;
+        const balAt = (list) => {
+            const entry = (list || []).find((b) => b.accountIndex === idx);
+            return entry ? BigInt(entry.uiTokenAmount.amount) : 0n;
+        };
+        const diff = balAt(tx.meta.preTokenBalances) - balAt(tx.meta.postTokenBalances);
+        return diff > 0n ? diff.toString() : null;
+    }
+
+    /**
+     * Automated funding of the claim treasury — keeps reward claims working with zero admin action:
+     *   fee vault (WSOL, accumulates all 1.1% trade fees) → claimProtocolFee() → treasury WSOL ATA
+     *   → close the ATA → native SOL lands in the treasury system account (what pays claims).
+     * Requires the on-chain global config's fee_recipient to BE the treasury wallet; otherwise the
+     * sweep would send funds to a wallet this server has no key for, so it refuses and reports why.
+     * Called from the cron scheduler; safe to run repeatedly (skips when below threshold).
+     */
+    async sweepFeeVaultToTreasury(minLamports = 1_000_000n) {
+        await this.initialize();
+        if (!this.treasuryKeypair) {
+            return { swept: false, reason: 'SOLANA_TREASURY_PRIVATE_KEY not set' };
+        }
+        const cfg = await this.program.account.globalConfig.fetch(this.getGlobalConfigPDA());
+        // claim_protocol_fee is owner-gated on-chain, so the sweep needs the server's key to BE the
+        // config owner; and fee_recipient must be the treasury so the swept funds land where claims
+        // are paid from. Both are set in one set-solana-roles run (signed by the CURRENT owner).
+        if (!cfg.owner || !cfg.owner.equals(this.treasuryKeypair.publicKey)) {
+            return {
+                swept: false,
+                reason: `config owner (${cfg.owner ? cfg.owner.toBase58() : 'none'}) is not the treasury key — ` +
+                    'run set-solana-roles (signed by the current owner) with SOLANA_CONFIG_OWNER=<treasury pubkey> to enable auto-funding',
+            };
+        }
+        if (!cfg.feeRecipient || !cfg.feeRecipient.equals(this.treasuryKeypair.publicKey)) {
+            return {
+                swept: false,
+                reason: `fee_recipient (${cfg.feeRecipient ? cfg.feeRecipient.toBase58() : 'none'}) is not the treasury — ` +
+                    'run set-solana-roles with SOLANA_FEE_RECIPIENT=<treasury pubkey> to enable auto-funding',
+            };
+        }
+
+        const feeAuthority = this.getFeeAuthorityPDA();
+        const vaultAta = getAssociatedTokenAddressSync(NATIVE_MINT, feeAuthority, true);
+        let vaultLamports = 0n;
+        try {
+            const bal = await this.connection.getTokenAccountBalance(vaultAta);
+            vaultLamports = BigInt(bal.value.amount);
+        } catch {
+            return { swept: false, reason: 'fee vault has no token account yet (no fees collected)' };
+        }
+        if (vaultLamports < minLamports) {
+            return { swept: false, reason: `vault below threshold (${vaultLamports} lamports)` };
+        }
+
+        await this.claimProtocolFee(); // vault → treasury WSOL ATA (creates the ATA on demand)
+
+        // Unwrap: closing the WSOL ATA credits its entire lamport balance (wrapped SOL + rent)
+        // to the treasury's native SOL account. The next sweep recreates the ATA on demand.
+        const treasuryAta = getAssociatedTokenAddressSync(NATIVE_MINT, this.treasuryKeypair.publicKey, false);
+        const closeTx = new Transaction().add(
+            createCloseAccountInstruction(treasuryAta, this.treasuryKeypair.publicKey, this.treasuryKeypair.publicKey)
+        );
+        await sendAndConfirmTransaction(this.connection, closeTx, [this.treasuryKeypair], {
+            commitment: 'confirmed',
+            skipPreflight: false,
+        });
+        return { swept: true, lamports: vaultLamports.toString() };
     }
 
     /**

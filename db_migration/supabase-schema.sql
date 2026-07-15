@@ -279,18 +279,39 @@ CREATE INDEX IF NOT EXISTS idx_token_holders_wallet ON token_holders(wallet_addr
 -- reward_fee minus already-claimed. Backend (service role) only.
 -- ============================================
 CREATE TABLE IF NOT EXISTS reward_claims (
-    id                 BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
-    chain              TEXT NOT NULL,
-    wallet             TEXT NOT NULL,
-    claimed_amount     TEXT NOT NULL DEFAULT '0',  -- cumulative lamports/wei already claimed
-    pending_amount     TEXT,                        -- in-flight claim amount (NULL when none)
-    pending_signature  TEXT,                        -- tx signature once the user submits
-    pending_expires_at TIMESTAMPTZ,                 -- in-flight lock expiry
-    updated_at         TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    id                     BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    chain                  TEXT NOT NULL,
+    wallet                 TEXT NOT NULL,
+    claimed_amount         TEXT NOT NULL DEFAULT '0',  -- cumulative TRADER lamports/wei already claimed
+    claimed_creator_amount TEXT NOT NULL DEFAULT '0',  -- cumulative CREATOR lamports/wei already claimed
+    pending_amount         TEXT,                        -- in-flight claim TOTAL (NULL when none)
+    pending_creator_amount TEXT,                        -- creator portion of the in-flight claim
+    pending_signature      TEXT,                        -- tx signature once the user submits
+    pending_expires_at     TIMESTAMPTZ,                 -- in-flight lock expiry
+    updated_at             TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     CONSTRAINT reward_claims_chain_wallet_unique UNIQUE (chain, wallet)
 );
 
 CREATE INDEX IF NOT EXISTS reward_claims_chain_wallet_idx ON reward_claims (chain, wallet);
+
+-- ============================================
+-- REWARD CLAIM HISTORY (per-payout audit trail; drives the profile page history)
+-- One row per finalized on-chain payout. Backend (service role) only.
+-- ============================================
+CREATE TABLE IF NOT EXISTS reward_claim_history (
+    id             BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    chain          TEXT NOT NULL,
+    wallet         TEXT NOT NULL,
+    trader_amount  TEXT NOT NULL DEFAULT '0',   -- lamports / wei
+    creator_amount TEXT NOT NULL DEFAULT '0',   -- lamports / wei
+    total_amount   TEXT NOT NULL,               -- lamports / wei (trader + creator)
+    tx_signature   TEXT NOT NULL,               -- Solana signature / EVM tx hash
+    created_at     TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    CONSTRAINT reward_claim_history_tx_unique UNIQUE (chain, tx_signature)
+);
+
+CREATE INDEX IF NOT EXISTS reward_claim_history_wallet_idx
+    ON reward_claim_history (chain, wallet, created_at DESC);
 
 -- ============================================
 -- ENABLE REALTIME FOR TABLES
