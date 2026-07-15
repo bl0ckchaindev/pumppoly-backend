@@ -73,17 +73,25 @@ class CronService {
         // platform never auto-pays rewards with its own gas. (Re-enable by restoring this cron.)
         console.log('ℹ Reward auto-distribution disabled — rewards are claim-only.');
 
-        // Solana claim-treasury auto-funding: sweep accumulated trade fees from the program's fee
-        // vault into the treasury wallet (native SOL) so user claims never depend on a manual
-        // top-up. No-ops (with a logged reason) until the on-chain fee_recipient is the treasury.
+        // Solana claim-treasury maintenance: the on-chain config owner (and thus the vault sweep)
+        // intentionally belongs to the client — the client runs scripts/sweep-protocol-fees.js.
+        // This job handles the server-side half: unwrap any WSOL that lands in the treasury and
+        // forward the platform's fee share to SOLANA_PLATFORM_FEE_WALLET, keeping the reward
+        // share in the treasury to pay trader claims.
+        let sweepSkipLogged = false;
         const treasurySweepJob = cron.schedule('*/5 * * * *', async () => {
             try {
                 const solanaService = require('./solanaService');
                 const result = await solanaService.sweepFeeVaultToTreasury();
                 if (result.swept) {
-                    console.log(`[Cron] Fee vault swept to treasury: ${result.lamports} lamports`);
-                } else if (!/below threshold|no fees collected/.test(result.reason || '')) {
-                    console.warn(`[Cron] Treasury sweep skipped: ${result.reason}`);
+                    console.log('[Cron] Fee vault swept to treasury');
+                }
+                if (result.unwrapped !== '0') {
+                    console.log(`[Cron] Treasury WSOL unwrapped: ${result.unwrapped} lamports; platform share forwarded: ${result.forwarded} lamports`);
+                }
+                if (result.reason && !sweepSkipLogged) {
+                    console.log(`[Cron] Treasury sweep note (logged once): ${result.reason}`);
+                    sweepSkipLogged = true;
                 }
             } catch (error) {
                 console.error('[Cron] Treasury sweep error:', error.message);
@@ -91,7 +99,7 @@ class CronService {
         }, { scheduled: false });
         this.jobs.push({ name: 'treasurySweep', job: treasurySweepJob });
         treasurySweepJob.start();
-        console.log('✓ Cron job started: Solana fee-vault → treasury sweep (every 5 min)');
+        console.log('✓ Cron job started: Treasury unwrap + platform-share forwarding (every 5 min)');
 
         // Holder indexer: refresh on-chain holder balances for active tokens every 2 minutes.
         const holderSyncJob = cron.schedule('*/2 * * * *', async () => {
