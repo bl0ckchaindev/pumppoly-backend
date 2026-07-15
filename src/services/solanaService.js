@@ -470,10 +470,17 @@ class SolanaService {
             })
             .signers([signer])
             .transaction();
+        // Let the treasury pay the network fee when it can, so automated sweeps don't slowly
+        // drain the owner wallet (which only needs to sign, not to hold gas).
+        const signers = [signer];
+        if (this.treasuryKeypair && !this.treasuryKeypair.publicKey.equals(signer.publicKey)) {
+            tx.feePayer = this.treasuryKeypair.publicKey;
+            signers.push(this.treasuryKeypair);
+        }
         const sig = await sendAndConfirmTransaction(
             this.connection,
             tx,
-            [signer],
+            signers,
             { commitment: 'confirmed', skipPreflight: false }
         );
         return sig;
@@ -794,10 +801,30 @@ class SolanaService {
         const treasuryPk = this.treasuryKeypair.publicKey;
         const result = { swept: false, unwrapped: '0', forwarded: '0', reason: null };
 
-        // ── Stage 1: owner-gated vault claim (usually the client's job, not the server's) ──
-        const serverIsOwner = cfg.owner && cfg.owner.equals(treasuryPk);
+        // ── Stage 1: owner-gated vault claim ──
+        // The signer must be the on-chain config owner. Resolution order:
+        //   1. the server treasury key, when it happens to BE the owner
+        //   2. the encrypted owner key from the secure_keys vault (scripts/store-owner-key.js),
+        //      which is what makes the sweep fully automatic while the client keeps their wallet
+        // Without either, sweeping stays a client action (scripts/sweep-protocol-fees.js).
         const recipientIsTreasury = cfg.feeRecipient && cfg.feeRecipient.equals(treasuryPk);
-        if (serverIsOwner && recipientIsTreasury) {
+        let ownerKeypair = null;
+        if (cfg.owner && cfg.owner.equals(treasuryPk)) {
+            ownerKeypair = this.treasuryKeypair;
+        } else {
+            const keyVault = require('../lib/keyVault');
+            const vaulted = await keyVault.loadSolanaKeypair('solana_config_owner').catch(() => null);
+            if (vaulted && cfg.owner && cfg.owner.equals(vaulted.publicKey)) {
+                ownerKeypair = vaulted;
+            } else if (vaulted) {
+                result.reason = `stored owner key (${vaulted.publicKey.toBase58()}) no longer matches the on-chain owner — re-run scripts/store-owner-key.js`;
+            }
+        }
+        if (ownerKeypair && !recipientIsTreasury) {
+            // Sweeping now would strand the trader-reward share in a wallet the server has no key
+            // for. fee_recipient must point at the treasury for automation (set-solana-roles).
+            result.reason = `fee_recipient (${cfg.feeRecipient ? cfg.feeRecipient.toBase58() : 'none'}) is not the treasury — auto-sweep disabled until it is (run set-solana-roles)`;
+        } else if (ownerKeypair) {
             const vaultAta = getAssociatedTokenAddressSync(NATIVE_MINT, this.getFeeAuthorityPDA(), true);
             let vaultLamports = 0n;
             try {
@@ -805,11 +832,11 @@ class SolanaService {
                 vaultLamports = BigInt(bal.value.amount);
             } catch { /* no vault token account yet — nothing collected */ }
             if (vaultLamports >= minLamports) {
-                await this.claimProtocolFee(); // vault → treasury WSOL ATA
+                await this.claimProtocolFee(ownerKeypair); // vault → treasury WSOL ATA
                 result.swept = true;
             }
-        } else {
-            result.reason = 'config owner is the client wallet — vault sweeps are run by the client (scripts/sweep-protocol-fees.js)';
+        } else if (!result.reason) {
+            result.reason = 'owner key not available — sweeps are manual (client runs scripts/sweep-protocol-fees.js) or store it encrypted via scripts/store-owner-key.js';
         }
 
         // ── Stage 2: unwrap any treasury WSOL + forward the platform share ──

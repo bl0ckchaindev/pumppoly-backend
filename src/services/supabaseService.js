@@ -1143,6 +1143,27 @@ class SupabaseService {
         });
     }
 
+    // ── secure_keys: encrypted key vault rows (see src/lib/keyVault.js) ──────────────────────────
+    async getSecureKey(name) {
+        const { data, error } = await supabase
+            .from('secure_keys')
+            .select('*')
+            .eq('name', name)
+            .maybeSingle();
+        if (error) { console.error('getSecureKey:', error.message); return null; }
+        return data || null;
+    }
+
+    async upsertSecureKey(name, { scheme, ciphertext, iv, tag }) {
+        const { error } = await supabase
+            .from('secure_keys')
+            .upsert(
+                { name, scheme, ciphertext, iv, tag, updated_at: new Date().toISOString() },
+                { onConflict: 'name' }
+            );
+        if (error) throw new Error('upsertSecureKey: ' + error.message);
+    }
+
     /** Record a finalized payout (idempotent: unique on (chain, tx_signature)). */
     async insertRewardClaimHistory({ chain, wallet, traderAmount, creatorAmount, totalAmount, txSignature }) {
         const { error } = await supabase
